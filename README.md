@@ -77,7 +77,7 @@ Web 服务使用 HTTP 且没有登录认证，只建议在可信局域网内访�
 
 ## 配置与安全约定
 
-- HTTPS 默认校验证书，内置信任根：`ISRG Root X1`、`GTS Root R4`、`DigiCert Global Root G2`、`Amazon Root CA 1`、`GlobalSign Root CA - R3`。自建或自签证书的服务，可在 DDNS 页取消勾选“校验 HTTPS 证书”
+- HTTPS 默认校验证书，内置信任根：`ISRG Root X1`、`GTS Root R4`、`DigiCert Global Root G2`、`Amazon Root CA 1`、`GlobalSign Root CA - R3`。自建、自签证书或服务端不支持 TLS 最大分片长度扩展时，可在 DDNS 页取消勾选“校验 HTTPS 证书”（勾选时串口会输出 `[tls]` 开头的失败原因）
 - 证书校验依赖系统时间，设备启动后通过 NTP 校时；时间未就绪时本轮 DDNS 会跳过并在下一周期重试
 - 密码与密钥不再回显：表单留空表示保持原值，输入 `-` 表示清空该项（WiFi 密码、DDNS 密码、AccessKey Secret、API Token、SecretKey、配置 AP 密码）
 - 服务商与记录类型做白名单校验，端口、同步周期等参数非法时会直接报错，不会静默改写

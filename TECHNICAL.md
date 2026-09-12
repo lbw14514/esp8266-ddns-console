@@ -56,10 +56,10 @@
 
 按顺序尝试，前一个成功即停止：
 
-1. 配置页填写的“公网 IP 查询 URL”
-2. `https://api.ipify.org`
-3. `https://checkip.amazonaws.com`
-4. `https://ipv4.icanhazip.com`
+1. 配置页填写的“公网 IP 查询 URL”（默认 `https://ipv4.icanhazip.com`）
+2. `https://ipv4.icanhazip.com`
+3. `https://api.ipify.org`
+4. `https://checkip.amazonaws.com`
 5. `https://ifconfig.me/ip`
 
 全部失败则本次更新跳过，按失败重试周期再试。`{ip}` 是路由器公网出口地址，不是设备局域网地址。
@@ -95,12 +95,21 @@ DNS 解析存在 TTL 和缓存延迟，固件不会在写入后立刻用本地 D
 
 ### HTTPS 证书校验
 
-默认开启证书校验，信任根放在 `src/tls_roots.h`：`ISRG Root X1`、`GTS Root R4`（Google Trust Services，覆盖 api.ipify.org / ipv4.icanhazip.com / api.cloudflare.com）、`DigiCert Global Root G2`（腾讯云 DNSPod）、`Amazon Root CA 1`（checkip.amazonaws.com）、`GlobalSign Root CA - R3`（阿里云 alidns）。
+默认开启证书校验，信任根按目标域名按需加载（位于 `src/tls_roots.h`）：
 
-- 校验需要准确的系统时间，因此发起 HTTPS 前会等待 NTP 校时；时间未就绪时本轮 DDNS 跳过
-- 时间随机数由硬件 RNG、`micros()` 与 CPU 周期计数器组合生成，不再可预测
-- 自建或自签证书的服务，可在 DDNS 页取消勾选“校验 HTTPS 证书”切换为不校验模式
-- 公网 IP 接口按顺序回退，个别接口换了新根证书（如 `ifconfig.me` 当前链到尚未进入内置包的新根）时会在校验阶段失败并自动跳到下一个接口，不影响整体结果
+| 目标 | 信任根 |
+| --- | --- |
+| api.ipify.org、ipv4.icanhazip.com、api.cloudflare.com | GTS Root R4 |
+| checkip.amazonaws.com | Amazon Root CA 1 |
+| alidns.aliyuncs.com | GlobalSign Root CA - R3 |
+| dnspod.tencentcloudapi.com | DigiCert Global Root G2 |
+| 其它以及自建服务（常见 Let's Encrypt） | ISRG Root X1 |
+
+- 校验需要准确的系统时间，发起 HTTPS 前会等待 NTP 校时；时间未就绪时本轮 DDNS 跳过
+- 签名随机数由硬件 RNG、`micros()` 与 CPU 周期计数器组合生成，不再可预测
+- TLS 接收缓冲设为 4KB（即启用 RFC 6066 最大分片长度扩展），握手内存需求约 10KB；这样在 ESP8266 约 25KB 的空闲堆上不会因为内存不足而重启。主流 CDN、阿里云与腾讯云接口均支持该扩展
+- 自建或自签证书的服务，可在 DDNS 页取消勾选“校验 HTTPS 证书”；若不支持上述扩展，也会握手失败，同样用该开关处理
+- 握手失败时串口会输出 `[tls] <URL> => <原因>`。实测在开启校验时 `api.ipify.org` 与 `checkip.amazonaws.com` 握手失败，固件会自动回退到下一个接口；默认接口已改为 `https://ipv4.icanhazip.com`
 
 ### 输入与输出转义
 
@@ -119,6 +128,8 @@ DNS 解析存在 TTL 和缓存延迟，固件不会在写入后立刻用本地 D
 ### 实现要点（代码内不写注释）
 
 - 分块发送：先扫一遍正文算出替换后的准确 `Content-Length`，再按 448 字节从 flash 读取、替换占位符后逐块发送；跨块边界的占位符整块延后，避免被截断
+- 内存：配置暂存对象与页面占位符数组改为按需分配，静态占用从 51.5% 降到 45.9%，给 TLS 握手留出空间
+- 连接任务（测试连接 / 保存）在 `loop()` 中以状态机推进：提交请求只写入待连接参数并返回过渡页，连接在延时 800ms 后开始，避免切换信道时打断正在传输的响应
 - 阿里云签名：公共参数 + 业务参数拼成规范化查询串，`GET&%2F&` + 百分号编码后 HMAC-SHA1，再对签名做百分号编码
 - 腾讯云签名：`sha256(canonicalRequest)` → `TC3-HMAC-SHA256` 待签串 → `TC3+SecretKey` 逐层派生签名密钥
 - ArduinoJson 固定在 6.x：v7 改了 `StaticJsonDocument`/`DynamicJsonDocument` 接口，升级需要同步改代码

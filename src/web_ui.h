@@ -108,7 +108,8 @@ var DICT={
 'hint.connecting':['正在连接 WiFi，请稍候…','Connecting to WiFi, please wait...'],
 'hint.connectOk':['连接成功，正在保存并重启设备','Connected, saving and restarting the device'],
 'hint.connectFail':['连接失败，请确认 WiFi 名称与密码后重试','Connection failed, check the WiFi name and password'],
-'lab.tls':['校验 HTTPS 证书（自建或自签证书可取消勾选）','Verify HTTPS certificates (uncheck for self-signed services)']
+'lab.tls':['校验 HTTPS 证书（自建或自签证书可取消勾选）','Verify HTTPS certificates (uncheck for self-signed services)'],
+'hint.afterSave':['保存后设备会切换到目标网络，本页可能瞬时断开；届时连接该 WiFi，用设备 IP 打开管理页','After saving, the device switches to the target network and this page may briefly disconnect; join that WiFi and open the device IP']
 };
 var EN=false;
 function L(k){var v=DICT[k];return v?(EN?v[1]:v[0]):k}
@@ -165,6 +166,7 @@ __MESSAGE__
 <span class="note full" data-i18n="hint.secret">密码与密钥不再回显：留空保持原值，输入 - 清空已保存内容</span>
 </div></section>
 <div class="actions"><span id="saveInfo" class="note"></span><button class="save" type="submit" data-i18n="btn.connect">保存并连接</button></div>
+<span class="note full" data-i18n="hint.afterSave">保存后设备会切换到目标网络，本页可能瞬时断开；届时连接该 WiFi，用设备 IP 打开管理页</span>
 </form>
 <span id="connectState" class="hidden" data-state="__CONNECT_STATE__"></span></main>
 <script>

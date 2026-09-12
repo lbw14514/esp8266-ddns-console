@@ -17,6 +17,7 @@ namespace {
 constexpr uint32_t CONFIG_MAGIC = 0x4553503C;
 constexpr size_t EEPROM_SIZE = 4096;
 constexpr uint16_t WIFI_CONNECT_TIMEOUT_MS = 15000;
+constexpr uint32_t WIFI_ATTEMPT_DELAY_MS = 800;
 constexpr uint32_t WIFI_RETRY_INTERVAL_MS = 15000;
 constexpr uint32_t PORTAL_FALLBACK_DELAY_MS = 5000;
 constexpr uint32_t PORTAL_HOLD_MS = 600000;
@@ -56,9 +57,9 @@ const char* const DDNS_RECORD_TYPES[] = {"A", "AAAA", "CNAME"};
 const char* const NTP_SERVERS[] = {"pool.ntp.org", "time.nist.gov"};
 
 const char* const DEFAULT_PUBLIC_IP_APIS[] = {
+  "https://ipv4.icanhazip.com",
   "https://api.ipify.org",
   "https://checkip.amazonaws.com",
-  "https://ipv4.icanhazip.com",
   "https://ifconfig.me/ip"
 };
 constexpr size_t DEFAULT_PUBLIC_IP_API_COUNT = sizeof(DEFAULT_PUBLIC_IP_APIS) / sizeof(DEFAULT_PUBLIC_IP_APIS[0]);
@@ -107,16 +108,18 @@ enum class ConnectJob : uint8_t { None, Probe, Save };
 
 struct ConnectAttempt {
   ConnectJob job = ConnectJob::None;
+  uint32_t startAt = 0;
   uint32_t startedAt = 0;
   uint32_t restartAt = 0;
   bool active = false;
+  bool started = false;
   bool resultReady = false;
   bool succeeded = false;
   bool dhcpAddresses = false;
 };
 
 DeviceConfig config{};
-DeviceConfig pendingConfig{};
+DeviceConfig* stagingConfig = nullptr;
 ConnectAttempt connectAttempt;
 ESP8266WebServer dashboardServer(DEFAULT_WEB_PORT);
 ESP8266WebServer apServer(DEFAULT_WEB_PORT);
@@ -130,21 +133,56 @@ String currentDdnsIp;
 String lastDdnsIp;
 uint32_t lastDdnsSync = 0;
 uint32_t nextDdnsAttempt = 0;
-BearSSL::X509List* trustAnchors = nullptr;
 
-BearSSL::X509List* getTrustAnchors() {
-  if (trustAnchors == nullptr) {
-    trustAnchors = new BearSSL::X509List(TLS_ROOT_CA_BUNDLE);
-  }
-  return trustAnchors;
+bool hostMatches(const String& url, const char* keyword) {
+  return url.indexOf(keyword) >= 0;
 }
 
-void configureSecureClient(BearSSL::WiFiClientSecure& client) {
-  if (config.tlsInsecure) {
-    client.setInsecure();
-    return;
+const char* rootPemForUrl(const String& url) {
+  if (hostMatches(url, "ipify.org") || hostMatches(url, "icanhazip.com") || hostMatches(url, "cloudflare.com")) {
+    return TLS_ROOT_GTS_R4;
   }
-  client.setTrustAnchors(getTrustAnchors());
+  if (hostMatches(url, "amazonaws.com")) {
+    return TLS_ROOT_AMAZON_CA1;
+  }
+  if (hostMatches(url, "aliyuncs.com")) {
+    return TLS_ROOT_GLOBALSIGN_R3;
+  }
+  if (hostMatches(url, "tencentcloudapi.com")) {
+    return TLS_ROOT_DIGICERT_G2;
+  }
+  return TLS_ROOT_ISRG_X1;
+}
+
+struct SecureConnection {
+  std::unique_ptr<BearSSL::X509List> anchors;
+  std::unique_ptr<BearSSL::WiFiClientSecure> client;
+
+  explicit SecureConnection(const String& url) {
+    client.reset(new BearSSL::WiFiClientSecure);
+    if (config.tlsInsecure) {
+      client->setInsecure();
+      return;
+    }
+    anchors.reset(new BearSSL::X509List(rootPemForUrl(url)));
+    if (anchors->getCount() == 0) {
+      Serial.println("证书信任根加载失败，本次请求将失败");
+    }
+    client->setTrustAnchors(anchors.get());
+    client->setBufferSizes(4096, 512);
+  }
+};
+
+DeviceConfig& staging() {
+  if (stagingConfig == nullptr) {
+    stagingConfig = new DeviceConfig(config);
+  }
+  return *stagingConfig;
+}
+
+void releaseStaging() {
+  delete stagingConfig;
+  stagingConfig = nullptr;
 }
 
 bool copyText(char* target, size_t targetSize, const String& value) {
@@ -521,6 +559,7 @@ const char PAGE_HEAD[] PROGMEM = "<!doctype html><html lang=\"zh-CN\"><head><met
 const char PAGE_STYLE_END[] PROGMEM = "</style><script>";
 const char PAGE_BODY_OPEN[] PROGMEM = "</script></head><body>";
 const char PAGE_END[] PROGMEM = "</body></html>";
+const char BUSY_PAGE[] PROGMEM = "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>ESP8266 Core</title></head><body style=\"margin:0;padding:28px;background:#0c1118;color:#e7edf5;font:15px/1.7 Arial,'Microsoft YaHei',sans-serif\"><h1 style=\"font-size:18px;margin:0 0 10px\">__TITLE__</h1><p style=\"color:#9fb0c4;margin:0\">__BODY__</p></body></html>";
 
 size_t streamSection(ESP8266WebServer* target, const char* section, const PageToken* tokens, size_t count) {
   size_t total = strlen_P(reinterpret_cast<PGM_P>(section));
@@ -602,6 +641,21 @@ void sendHtmlPage(ESP8266WebServer& target, int code, const char* body, const Pa
   streamSection(&target, PAGE_END, nullptr, 0);
 }
 
+void sendStandalonePage(ESP8266WebServer& target, const char* body, const PageToken* tokens, size_t count) {
+  target.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  target.setContentLength(streamSection(nullptr, body, tokens, count));
+  target.send(200, "text/html; charset=utf-8", "");
+  streamSection(&target, body, tokens, count);
+}
+
+void sendBusyPage() {
+  PageToken tokens[4];
+  TokenCollector page = {tokens, 0, 4};
+  replaceAll(page, "__TITLE__", "正在连接 WiFi");
+  replaceAll(page, "__BODY__", "设备正在连接你选择的网络，本页会瞬时断开。请连接该 WiFi，并用设备 IP 打开管理页。");
+  sendStandalonePage(apServer, BUSY_PAGE, tokens, page.count);
+}
+
 void clearConnectResult() {
   if (connectAttempt.active) {
     return;
@@ -641,19 +695,18 @@ String connectStateJson() {
 
 void beginConnectAttempt(ConnectJob job, bool dhcpAddresses) {
   connectAttempt.job = job;
-  connectAttempt.startedAt = millis();
+  connectAttempt.startAt = millis() + WIFI_ATTEMPT_DELAY_MS;
+  connectAttempt.startedAt = 0;
   connectAttempt.active = true;
+  connectAttempt.started = false;
   connectAttempt.resultReady = false;
   connectAttempt.succeeded = false;
   connectAttempt.dhcpAddresses = dhcpAddresses;
   connectAttempt.restartAt = 0;
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.disconnect();
-  delay(50);
-  WiFi.begin(pendingConfig.wifiSsid, pendingConfig.wifiPassword);
 }
 
 void finishConnectAttempt() {
+  DeviceConfig& pendingConfig = staging();
   connectAttempt.active = false;
   connectAttempt.resultReady = true;
   if (!connectAttempt.succeeded) {
@@ -680,10 +733,21 @@ void finishConnectAttempt() {
     portalHoldUntil = millis() + 3000;
     connectAttempt.restartAt = millis() + 3000;
   }
+  releaseStaging();
 }
 
 void serviceConnectAttempt() {
-  if (connectAttempt.active) {
+  DeviceConfig& pendingConfig = staging();
+  if (connectAttempt.active && !connectAttempt.started &&
+      static_cast<int32_t>(millis() - connectAttempt.startAt) >= 0) {
+    connectAttempt.started = true;
+    connectAttempt.startedAt = millis();
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.begin(pendingConfig.wifiSsid, pendingConfig.wifiPassword);
+    Serial.printf("开始连接 WiFi: %s\n", pendingConfig.wifiSsid);
+    return;
+  }
+  if (connectAttempt.active && connectAttempt.started) {
     if (WiFi.status() == WL_CONNECTED && WiFi.SSID() == String(pendingConfig.wifiSsid)) {
       connectAttempt.succeeded = true;
       finishConnectAttempt();
@@ -709,7 +773,7 @@ void addEscapedFields(TokenCollector& page, const PageField* fields, size_t coun
 }
 
 void sendDashboardPage(ESP8266WebServer& target, int code = 200, const String& message = "", const char* kind = "") {
-  static PageToken tokens[MAX_PAGE_TOKENS];
+  PageToken* tokens = new PageToken[MAX_PAGE_TOKENS];
   TokenCollector page = {tokens, 0, MAX_PAGE_TOKENS};
   const PageField fields[] = {
     {"__SSID__", config.wifiSsid},
@@ -752,10 +816,11 @@ void sendDashboardPage(ESP8266WebServer& target, int code = 200, const String& m
   replaceAll(page, "__FORCE__", String(config.ddnsForceSec));
   replaceAll(page, "__TLS_CHECKED__", config.tlsInsecure ? "" : " checked");
   sendHtmlPage(target, code, WEB_DASHBOARD_BODY, tokens, page.count);
+  delete[] tokens;
 }
 
 void sendSetupPage(ESP8266WebServer& target, int code = 200, const String& message = "", const char* kind = "") {
-  static PageToken tokens[MAX_PAGE_TOKENS];
+  PageToken* tokens = new PageToken[MAX_PAGE_TOKENS];
   TokenCollector page = {tokens, 0, MAX_PAGE_TOKENS};
   const PageField fields[] = {
     {"__IP__", config.staticIp},
@@ -771,6 +836,7 @@ void sendSetupPage(ESP8266WebServer& target, int code = 200, const String& messa
   replaceAll(page, "__PORT__", String(config.webPort));
   replaceAll(page, "__CONNECT_STATE__", connectStateName());
   sendHtmlPage(target, code, WEB_SETUP_BODY, tokens, page.count);
+  delete[] tokens;
 }
 
 String escapeJson(const String& value) {
@@ -791,8 +857,14 @@ String escapeJson(const String& value) {
 }
 
 void handleApRoot() {
+  String message;
+  const char* kind = "";
+  if (connectAttempt.resultReady && !connectAttempt.succeeded) {
+    message = "上次保存失败：无法连接该 WiFi，请检查名称与密码后重试。";
+    kind = "err";
+  }
   clearConnectResult();
-  sendSetupPage(apServer, 200);
+  sendSetupPage(apServer, 200, message, kind);
 }
 
 String buildScanJson() {
@@ -851,6 +923,7 @@ void handleApProbe() {
     sendJson(apServer, 200, connectStateJson());
     return;
   }
+  DeviceConfig& pendingConfig = staging();
   String ssid = apServer.arg("ssid");
   ssid.trim();
   if (ssid.length() == 0) {
@@ -860,8 +933,7 @@ void handleApProbe() {
   pendingConfig = config;
   copyText(pendingConfig.wifiSsid, sizeof(pendingConfig.wifiSsid), ssid);
   applySecretValue(pendingConfig.wifiPassword, sizeof(pendingConfig.wifiPassword), apServer.arg("wifiPassword"));
-  Serial.printf("测试连接 %s\n", pendingConfig.wifiSsid);
-  beginConnectAttempt(ConnectJob::Probe, false);
+  Serial.printf("测试连接 %s\n", pendingConfig.wifiSsid);  beginConnectAttempt(ConnectJob::Probe, false);
   sendJson(apServer, 200, connectStateJson());
 }
 
@@ -874,34 +946,34 @@ void handleApSave() {
     sendSetupPage(apServer, 409, "上一次连接仍在进行，请稍候。", "err");
     return;
   }
-  DeviceConfig candidate = config;
-  copyText(candidate.wifiSsid, sizeof(candidate.wifiSsid), apServer.arg("ssid"));
-  applySecretValue(candidate.wifiPassword, sizeof(candidate.wifiPassword), apServer.arg("wifiPassword"));
-  applySecretValue(candidate.apPassword, sizeof(candidate.apPassword), apServer.arg("apPassword"));
-  copyText(candidate.staticIp, sizeof(candidate.staticIp), apServer.arg("ip"));
-  copyText(candidate.gateway, sizeof(candidate.gateway), apServer.arg("gateway"));
-  copyText(candidate.subnet, sizeof(candidate.subnet), apServer.arg("subnet"));
-  copyText(candidate.dns, sizeof(candidate.dns), apServer.arg("dns"));
+  DeviceConfig& pendingConfig = staging();
+  pendingConfig = config;
+  copyText(pendingConfig.wifiSsid, sizeof(pendingConfig.wifiSsid), apServer.arg("ssid"));
+  applySecretValue(pendingConfig.wifiPassword, sizeof(pendingConfig.wifiPassword), apServer.arg("wifiPassword"));
+  applySecretValue(pendingConfig.apPassword, sizeof(pendingConfig.apPassword), apServer.arg("apPassword"));
+  copyText(pendingConfig.staticIp, sizeof(pendingConfig.staticIp), apServer.arg("ip"));
+  copyText(pendingConfig.gateway, sizeof(pendingConfig.gateway), apServer.arg("gateway"));
+  copyText(pendingConfig.subnet, sizeof(pendingConfig.subnet), apServer.arg("subnet"));
+  copyText(pendingConfig.dns, sizeof(pendingConfig.dns), apServer.arg("dns"));
   uint16_t port = 0;
   if (!parsePort(apServer.arg("port"), port)) {
     sendSetupPage(apServer, 400, "Web 端口需为 1-65535 之间的整数。", "err");
     return;
   }
-  candidate.webPort = port;
-  String ssid = candidate.wifiSsid;
+  pendingConfig.webPort = port;
+  String ssid = pendingConfig.wifiSsid;
   ssid.trim();
   if (ssid.length() == 0) {
     sendSetupPage(apServer, 400, "请填写或选择 WiFi 名称。", "err");
     return;
   }
-  if (strlen(candidate.apPassword) < AP_PASSWORD_MIN_LENGTH) {
+  if (strlen(pendingConfig.apPassword) < AP_PASSWORD_MIN_LENGTH) {
     sendSetupPage(apServer, 400, "配置 AP 密码至少需要 8 位。", "err");
     return;
   }
-  pendingConfig = candidate;
   Serial.printf("尝试连接 WiFi: %s\n", pendingConfig.wifiSsid);
   beginConnectAttempt(ConnectJob::Save, apServer.arg("autoNet") == "1");
-  sendSetupPage(apServer, 200, "正在连接 WiFi，请稍候…", "ok");
+  sendBusyPage();
 }
 
 void startSetupPortal() {
@@ -915,7 +987,8 @@ void startSetupPortal() {
   WiFi.mode(WIFI_AP_STA);
   portalHoldUntil = 0;
   bool secured = strlen(config.apPassword) >= 8;
-  WiFi.softAP(SETUP_AP_SSID, secured ? config.apPassword : nullptr);  delay(SETUP_AP_CHANNEL_DELAY_MS);
+  WiFi.softAP(SETUP_AP_SSID, secured ? config.apPassword : nullptr);
+  delay(SETUP_AP_CHANNEL_DELAY_MS);
   if (!apRoutesReady) {
     apServer.on("/", HTTP_GET, handleApRoot);
     apServer.on("/scan", HTTP_GET, handleApScan);
@@ -949,48 +1022,49 @@ void handleRoot() {
 }
 
 bool applyFormConfig(ESP8266WebServer& source, String& error) {
-  DeviceConfig candidate = config;
-  copyText(candidate.wifiSsid, sizeof(candidate.wifiSsid), source.arg("ssid"));
-  applySecretValue(candidate.wifiPassword, sizeof(candidate.wifiPassword), source.arg("wifiPassword"));
-  copyText(candidate.staticIp, sizeof(candidate.staticIp), source.arg("ip"));
-  copyText(candidate.gateway, sizeof(candidate.gateway), source.arg("gateway"));
-  copyText(candidate.subnet, sizeof(candidate.subnet), source.arg("subnet"));
-  copyText(candidate.dns, sizeof(candidate.dns), source.arg("dns"));
-  copyText(candidate.ddnsHostname, sizeof(candidate.ddnsHostname), source.arg("hostname"));
-  copyText(candidate.ddnsUsername, sizeof(candidate.ddnsUsername), source.arg("ddnsUsername"));
-  applySecretValue(candidate.ddnsPassword, sizeof(candidate.ddnsPassword), source.arg("ddnsPassword"));
-  copyText(candidate.ddnsUrl, sizeof(candidate.ddnsUrl), source.arg("ddnsUrl"));
-  copyText(candidate.ddnsProvider, sizeof(candidate.ddnsProvider), source.arg("ddnsProvider"));
-  copyText(candidate.aliyunAccessKeyId, sizeof(candidate.aliyunAccessKeyId), source.arg("aliyunAccessKeyId"));
-  applySecretValue(candidate.aliyunAccessKeySecret, sizeof(candidate.aliyunAccessKeySecret), source.arg("aliyunAccessKeySecret"));
-  copyText(candidate.aliyunDomainName, sizeof(candidate.aliyunDomainName), source.arg("aliyunDomainName"));
-  copyText(candidate.aliyunRR, sizeof(candidate.aliyunRR), source.arg("aliyunRR"));
-  copyText(candidate.aliyunType, sizeof(candidate.aliyunType), source.arg("aliyunType"));
-  applySecretValue(candidate.cloudflareApiToken, sizeof(candidate.cloudflareApiToken), source.arg("cloudflareApiToken"));
-  copyText(candidate.cloudflareZoneId, sizeof(candidate.cloudflareZoneId), source.arg("cloudflareZoneId"));
-  copyText(candidate.cloudflareRecordId, sizeof(candidate.cloudflareRecordId), source.arg("cloudflareRecordId"));
-  copyText(candidate.tencentSecretId, sizeof(candidate.tencentSecretId), source.arg("tencentSecretId"));
-  applySecretValue(candidate.tencentSecretKey, sizeof(candidate.tencentSecretKey), source.arg("tencentSecretKey"));
-  copyText(candidate.tencentDomain, sizeof(candidate.tencentDomain), source.arg("tencentDomain"));
-  copyText(candidate.tencentSubDomain, sizeof(candidate.tencentSubDomain), source.arg("tencentSubDomain"));
-  copyText(candidate.tencentRecordType, sizeof(candidate.tencentRecordType), source.arg("tencentRecordType"));
-  copyText(candidate.ddnsIpUrl, sizeof(candidate.ddnsIpUrl), source.arg("ddnsIpUrl"));
-  copyText(candidate.ddnsSuccess, sizeof(candidate.ddnsSuccess), source.arg("ddnsSuccess"));
-  copyText(candidate.ddnsBody, sizeof(candidate.ddnsBody), source.arg("ddnsBody"));
-  copyText(candidate.ddnsHeaders, sizeof(candidate.ddnsHeaders), source.arg("ddnsHeaders"));
-  normalizeProvider(candidate.ddnsProvider, sizeof(candidate.ddnsProvider));
-  normalizeRecordType(candidate.aliyunType, sizeof(candidate.aliyunType));
-  normalizeRecordType(candidate.tencentRecordType, sizeof(candidate.tencentRecordType));
+  DeviceConfig& pendingConfig = staging();
+  pendingConfig = config;
+  copyText(pendingConfig.wifiSsid, sizeof(pendingConfig.wifiSsid), source.arg("ssid"));
+  applySecretValue(pendingConfig.wifiPassword, sizeof(pendingConfig.wifiPassword), source.arg("wifiPassword"));
+  copyText(pendingConfig.staticIp, sizeof(pendingConfig.staticIp), source.arg("ip"));
+  copyText(pendingConfig.gateway, sizeof(pendingConfig.gateway), source.arg("gateway"));
+  copyText(pendingConfig.subnet, sizeof(pendingConfig.subnet), source.arg("subnet"));
+  copyText(pendingConfig.dns, sizeof(pendingConfig.dns), source.arg("dns"));
+  copyText(pendingConfig.ddnsHostname, sizeof(pendingConfig.ddnsHostname), source.arg("hostname"));
+  copyText(pendingConfig.ddnsUsername, sizeof(pendingConfig.ddnsUsername), source.arg("ddnsUsername"));
+  applySecretValue(pendingConfig.ddnsPassword, sizeof(pendingConfig.ddnsPassword), source.arg("ddnsPassword"));
+  copyText(pendingConfig.ddnsUrl, sizeof(pendingConfig.ddnsUrl), source.arg("ddnsUrl"));
+  copyText(pendingConfig.ddnsProvider, sizeof(pendingConfig.ddnsProvider), source.arg("ddnsProvider"));
+  copyText(pendingConfig.aliyunAccessKeyId, sizeof(pendingConfig.aliyunAccessKeyId), source.arg("aliyunAccessKeyId"));
+  applySecretValue(pendingConfig.aliyunAccessKeySecret, sizeof(pendingConfig.aliyunAccessKeySecret), source.arg("aliyunAccessKeySecret"));
+  copyText(pendingConfig.aliyunDomainName, sizeof(pendingConfig.aliyunDomainName), source.arg("aliyunDomainName"));
+  copyText(pendingConfig.aliyunRR, sizeof(pendingConfig.aliyunRR), source.arg("aliyunRR"));
+  copyText(pendingConfig.aliyunType, sizeof(pendingConfig.aliyunType), source.arg("aliyunType"));
+  applySecretValue(pendingConfig.cloudflareApiToken, sizeof(pendingConfig.cloudflareApiToken), source.arg("cloudflareApiToken"));
+  copyText(pendingConfig.cloudflareZoneId, sizeof(pendingConfig.cloudflareZoneId), source.arg("cloudflareZoneId"));
+  copyText(pendingConfig.cloudflareRecordId, sizeof(pendingConfig.cloudflareRecordId), source.arg("cloudflareRecordId"));
+  copyText(pendingConfig.tencentSecretId, sizeof(pendingConfig.tencentSecretId), source.arg("tencentSecretId"));
+  applySecretValue(pendingConfig.tencentSecretKey, sizeof(pendingConfig.tencentSecretKey), source.arg("tencentSecretKey"));
+  copyText(pendingConfig.tencentDomain, sizeof(pendingConfig.tencentDomain), source.arg("tencentDomain"));
+  copyText(pendingConfig.tencentSubDomain, sizeof(pendingConfig.tencentSubDomain), source.arg("tencentSubDomain"));
+  copyText(pendingConfig.tencentRecordType, sizeof(pendingConfig.tencentRecordType), source.arg("tencentRecordType"));
+  copyText(pendingConfig.ddnsIpUrl, sizeof(pendingConfig.ddnsIpUrl), source.arg("ddnsIpUrl"));
+  copyText(pendingConfig.ddnsSuccess, sizeof(pendingConfig.ddnsSuccess), source.arg("ddnsSuccess"));
+  copyText(pendingConfig.ddnsBody, sizeof(pendingConfig.ddnsBody), source.arg("ddnsBody"));
+  copyText(pendingConfig.ddnsHeaders, sizeof(pendingConfig.ddnsHeaders), source.arg("ddnsHeaders"));
+  normalizeProvider(pendingConfig.ddnsProvider, sizeof(pendingConfig.ddnsProvider));
+  normalizeRecordType(pendingConfig.aliyunType, sizeof(pendingConfig.aliyunType));
+  normalizeRecordType(pendingConfig.tencentRecordType, sizeof(pendingConfig.tencentRecordType));
   String method = source.arg("ddnsMethod");
   method.toUpperCase();
-  copyText(candidate.ddnsMethod, sizeof(candidate.ddnsMethod), method == DDNS_POST ? DDNS_POST : DDNS_GET);
-  candidate.tlsInsecure = source.arg("tlsInsecure") == "1" ? 1 : 0;
+  copyText(pendingConfig.ddnsMethod, sizeof(pendingConfig.ddnsMethod), method == DDNS_POST ? DDNS_POST : DDNS_GET);
+  pendingConfig.tlsInsecure = source.arg("tlsInsecure") == "1" ? 1 : 0;
   uint16_t port = 0;
   if (!parsePort(source.arg("port"), port)) {
     error = "Web 端口需为 1-65535 之间的整数。";
     return false;
   }
-  candidate.webPort = port;
+  pendingConfig.webPort = port;
   long interval = source.arg("ddnsIntervalSec").toInt();
   if (interval < static_cast<long>(DDNS_INTERVAL_MIN_SEC) || interval > static_cast<long>(DDNS_INTERVAL_MAX_SEC)) {
     error = "DDNS 检查间隔需在 10-604800 秒之间。";
@@ -1006,28 +1080,27 @@ bool applyFormConfig(ESP8266WebServer& source, String& error) {
     error = "DDNS 强制更新间隔需在 600-2592000 秒之间。";
     return false;
   }
-  candidate.ddnsIntervalSec = static_cast<uint32_t>(interval);
-  candidate.ddnsRetrySec = static_cast<uint32_t>(retry);
-  candidate.ddnsForceSec = static_cast<uint32_t>(force);
-  applySecretValue(candidate.apPassword, sizeof(candidate.apPassword), source.arg("apPassword"));
-  if (strlen(candidate.apPassword) < AP_PASSWORD_MIN_LENGTH) {
+  pendingConfig.ddnsIntervalSec = static_cast<uint32_t>(interval);
+  pendingConfig.ddnsRetrySec = static_cast<uint32_t>(retry);
+  pendingConfig.ddnsForceSec = static_cast<uint32_t>(force);
+  applySecretValue(pendingConfig.apPassword, sizeof(pendingConfig.apPassword), source.arg("apPassword"));
+  if (strlen(pendingConfig.apPassword) < AP_PASSWORD_MIN_LENGTH) {
     error = "配置 AP 密码至少需要 8 位。";
     return false;
   }
-  config = candidate;
+  config = pendingConfig;
   return true;
 }
 
 void handleSave() {
-  DeviceConfig previous = config;
   String error;
   if (!applyFormConfig(dashboardServer, error)) {
-    config = previous;
     sendDashboardPage(dashboardServer, 400, error, "err");
     return;
   }
   applyAddressFallback();
   saveConfig();
+  releaseStaging();
   sendDashboardPage(dashboardServer, 200, "配置已保存，设备正在重启。", "ok");
   delay(RESTART_DELAY_MS);
   ESP.restart();
@@ -1064,14 +1137,18 @@ String replacePlaceholders(String url) {
 }
 
 String httpGetBody(const String& url, int& status) {
-  std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
-  configureSecureClient(*client);
+  SecureConnection secure(url);
   HTTPClient http;
-  if (!http.begin(*client, url)) {
+  if (!http.begin(*secure.client, url)) {
     status = -1;
     return "";
   }
   status = http.GET();
+  if (status < 0 && !config.tlsInsecure) {
+    char message[128];
+    secure.client->getLastSSLError(message, sizeof(message));
+    Serial.printf("[tls] %s => %s\n", url.c_str(), message);
+  }
   String body = http.getString();
   http.end();
   return body;
@@ -1318,10 +1395,9 @@ bool updateCloudflareDdns() {
   url += config.cloudflareZoneId;
   url += "/dns_records/";
   url += config.cloudflareRecordId;
-  std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
-  configureSecureClient(*client);
+  SecureConnection secure(url);
   HTTPClient http;
-  if (!http.begin(*client, url)) {
+  if (!http.begin(*secure.client, url)) {
     Serial.println("Cloudflare API 无法连接");
     return false;
   }
@@ -1365,10 +1441,9 @@ String tencentAuthorization(const String& payload, uint32_t timestamp) {
 
 String tencentRequest(const String& action, const String& payload, int& status) {
   uint32_t timestamp = static_cast<uint32_t>(time(nullptr));
-  std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
-  configureSecureClient(*client);
+  SecureConnection secure(DNSPOD_API_HOST);
   HTTPClient http;
-  if (!http.begin(*client, DNSPOD_API_HOST)) {
+  if (!http.begin(*secure.client, DNSPOD_API_HOST)) {
     status = -1;
     return "";
   }
@@ -1434,10 +1509,9 @@ bool updateGenericDdns() {
     return false;
   }
   String url = replacePlaceholders(config.ddnsUrl);
-  std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
-  configureSecureClient(*client);
+  SecureConnection secure(url);
   HTTPClient http;
-  if (!http.begin(*client, url)) {
+  if (!http.begin(*secure.client, url)) {
     Serial.println("DDNS URL 无法连接");
     return false;
   }
