@@ -24,12 +24,21 @@
 | 路径 | 方法 | 说明 |
 | --- | --- | --- |
 | `/` | GET | 运行页（仪表盘）或配网页，按当前模式返回 |
-| `/netinfo` | GET | 返回当前 IP、网关、掩码、DNS、RSSI 的 JSON |
+| `/netinfo` | GET | 返回当前 SSID、IP、网关、掩码、DNS、RSSI 的 JSON |
 | `/scan` | GET | 扫描附近 WiFi，返回 `[{"s":"名称","r":信号}]` |
-| `/probe` | POST | 配网页使用：用表单中的 WiFi 账号试连并返回地址信息 |
-| `/save` | POST | 保存配置并重启 |
+| `/probe` | POST | 配网页使用：提交 WiFi 账号，立即返回 `pending`，连接在后台进行 |
+| `/probe` | GET | 查询测试连接结果，`state` 为 `pending` / `ok` / `fail` |
+| `/connectstate` | GET | 查询保存任务的连接状态，成功后设备保存配置并重启 |
+| `/save` | POST | 仪表盘：校验并保存配置后重启 |
+| `/save` | POST | 配网页：校验参数后启动后台连接任务 |
 
 页面为单文件自研样式，不引用任何外部资源，并带 `Cache-Control: no-store` 防止浏览器缓存旧页面。
+
+### 非阻塞连接
+
+配网的“测试连接”和“保存”不再在 HTTP 处理函数里阻塞：提交后立即返回，连接在 `loop()` 里的状态机中推进，页面每 1.5 秒轮询一次状态。好处是连接过程中配置页仍可响应、可重复扫描，不会出现 15 秒无响应。
+
+状态机字段：`job`（probe/save）、`active`、`resultReady`、`succeeded`、`dhcpAddresses`、`restartAt`。保存成功后会保持 AP 3 秒再重启，让页面能显示“连接成功”。
 
 ### 页面为什么按分块发送
 
@@ -82,7 +91,36 @@ DNS 解析存在 TTL 和缓存延迟，固件不会在写入后立刻用本地 D
 - Cloudflare：通过 API Token 调用 `PATCH /zones/{zone}/dns_records/{record}` 写入，记录类型固定 A。
 - 通用 Callback：自定义更新 URL、方法、请求体、Header 与成功关键字。
 
-只有 A 记录会被自动更新，选择 AAAA 或 CNAME 时固件会跳过并输出日志。HTTPS 请求使用 BearSSL 安全客户端，为了兼容自建和自签名服务，允许服务端证书校验失败。
+只有 A 记录会被自动更新，选择 AAAA 或 CNAME 时固件会集中判定并跳过写入（不算失败，不触发重试风暴）。
+
+### HTTPS 证书校验
+
+默认开启证书校验，信任根放在 `src/tls_roots.h`：`ISRG Root X1`、`GTS Root R4`（Google Trust Services，覆盖 api.ipify.org / ipv4.icanhazip.com / api.cloudflare.com）、`DigiCert Global Root G2`（腾讯云 DNSPod）、`Amazon Root CA 1`（checkip.amazonaws.com）、`GlobalSign Root CA - R3`（阿里云 alidns）。
+
+- 校验需要准确的系统时间，因此发起 HTTPS 前会等待 NTP 校时；时间未就绪时本轮 DDNS 跳过
+- 时间随机数由硬件 RNG、`micros()` 与 CPU 周期计数器组合生成，不再可预测
+- 自建或自签证书的服务，可在 DDNS 页取消勾选“校验 HTTPS 证书”切换为不校验模式
+
+### 输入与输出转义
+
+- HTML 上下文（表单 value、文本节点）统一走 `htmlEscape`，转义 `& < > " '`
+- JSON 上下文（扫描结果、WiFi 名称）统一走 `escapeJson`，转义反斜杠与双引号并丢弃控制字符
+- 服务商、记录类型、Callback 方法做白名单归一化
+- 页面占位符写入带容量上限检查，超出会在串口输出日志而不会越界
+
+### 配置持久化细节
+
+- 结构体末尾存放 CRC32，加载时校验 `magic` + `crc` + 取值范围，任一不满足即恢复默认值
+- `EEPROM.commit()` 返回值会被检查，失败时输出日志
+- 字段超长会被截断，并在串口输出截断前后的长度
+- 密码与密钥不回显到页面：提交值为空则保持原值，提交 `-` 则清空
+
+### 实现要点（代码内不写注释）
+
+- 分块发送：先扫一遍正文算出替换后的准确 `Content-Length`，再按 448 字节从 flash 读取、替换占位符后逐块发送；跨块边界的占位符整块延后，避免被截断
+- 阿里云签名：公共参数 + 业务参数拼成规范化查询串，`GET&%2F&` + 百分号编码后 HMAC-SHA1，再对签名做百分号编码
+- 腾讯云签名：`sha256(canonicalRequest)` → `TC3-HMAC-SHA256` 待签串 → `TC3+SecretKey` 逐层派生签名密钥
+- ArduinoJson 固定在 6.x：v7 改了 `StaticJsonDocument`/`DynamicJsonDocument` 接口，升级需要同步改代码
 
 ## 配置持久化与重启恢复
 
@@ -92,7 +130,7 @@ DNS 解析存在 TTL 和缓存延迟，固件不会在写入后立刻用本地 D
 - 静态 IP、网关、子网掩码、DNS、Web 端口
 - DDNS 厂商、域名、Token、AccessKey、SecretKey
 - 公网 IP 查询 URL、Callback 方法、请求体、Header、成功关键字
-- 三个同步周期参数与配置 AP 密码
+- 三个同步周期参数、配置 AP 密码、HTTPS 证书校验开关
 
 保存时会提交 EEPROM。只有配置校验失败、存储内容损坏或配置版本变化时，才会回到默认值并重新进入配网。
 

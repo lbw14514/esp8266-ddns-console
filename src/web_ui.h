@@ -102,12 +102,19 @@ var DICT={
 'hint.onlyA':['仅 A 记录支持自动更新','Only A records are updated automatically'],
 'hint.ipAccess':['此 IP 为用户连接该网络后访问本设备所需的地址，同网络的设备用 http://该IP 打开管理页','This IP is the address users need to visit after connecting to that network, e.g. http://the-ip'],
 'hint.probing':['正在测试连接，请稍候...','Testing connection, please wait...'],'hint.probeOk':['获取成功，已填入地址：','Fetched, address filled:'],'hint.probeWarn':['（若配网页断开，请重新连接 ESP8266-Setup 后再保存）','(If this page disconnects, reconnect to ESP8266-Setup and save)'],'hint.probeFail':['连接失败，请确认 WiFi 名称和密码','Connection failed, verify the WiFi name and password'],
-'hint.manual':['取消勾选后使用下方手动填写的地址','When unchecked, the addresses below are used']
+'hint.manual':['取消勾选后使用下方手动填写的地址','When unchecked, the addresses below are used'],
+'hint.secret':['密码与密钥不再回显：留空保持原值，输入 - 清空已保存内容','Passwords and keys are never shown: leave blank to keep, enter - to clear'],
+'hint.secretShort':['留空保持不变','Leave blank to keep'],
+'hint.connecting':['正在连接 WiFi，请稍候…','Connecting to WiFi, please wait...'],
+'hint.connectOk':['连接成功，正在保存并重启设备','Connected, saving and restarting the device'],
+'hint.connectFail':['连接失败，请确认 WiFi 名称与密码后重试','Connection failed, check the WiFi name and password'],
+'lab.tls':['校验 HTTPS 证书（自建或自签证书可取消勾选）','Verify HTTPS certificates (uncheck for self-signed services)']
 };
 var EN=false;
 function L(k){var v=DICT[k];return v?(EN?v[1]:v[0]):k}
 function applyLang(){
  document.querySelectorAll('[data-i18n]').forEach(function(el){var k=el.dataset.i18n;if(!k||!DICT[k])return;if(el.children.length>0)return;el.textContent=L(k)});
+ document.querySelectorAll('[data-i18n-ph]').forEach(function(el){var k=el.dataset.i18nPh;if(k&&DICT[k])el.placeholder=L(k)});
  var lb=document.getElementById('language'); if(lb)lb.textContent=EN?'中文':'English';
  document.documentElement.lang=EN?'en':'zh-CN';
  document.title=EN?'ESP8266 Console':'ESP8266 控制台';
@@ -139,8 +146,8 @@ __MESSAGE__
 <label><span data-i18n="lab.ssid">WiFi 名称</span><select id="ssidSelect"></select></label>
 <label id="ssidManualWrap" class="hidden"><span data-i18n="lab.ssidManual">手动输入 WiFi 名称</span><input id="ssidManual" value="__SSID__"></label>
 <input type="hidden" id="ssid" name="ssid" value="__SSID__">
-<label><span data-i18n="lab.wifipass">WiFi 密码</span><input id="wifiPassword" name="wifiPassword" type="password" value="__WIFI_PASSWORD__"></label>
-<label><span data-i18n="lab.ap">配置 AP 密码</span><input name="apPassword" type="password" value="__AP_PASSWORD__"></label>
+<label><span data-i18n="lab.wifipass">WiFi 密码</span><input id="wifiPassword" name="wifiPassword" type="password" value="" data-i18n-ph="hint.secretShort"></label>
+<label><span data-i18n="lab.ap">配置 AP 密码</span><input name="apPassword" type="password" value="" data-i18n-ph="hint.secretShort"></label>
 <label><span data-i18n="lab.port">Web 端口</span><input name="port" type="number" value="__PORT__"></label>
 <div class="row full"><button class="btn" type="button" id="scanBtn" data-i18n="btn.scan">扫描附近 WiFi</button><span id="scanInfo" class="note"></span></div>
 </div></div></section>
@@ -155,9 +162,11 @@ __MESSAGE__
 </div>
 <div class="row" style="margin-top:15px"><button class="btn" type="button" id="probeBtn" data-i18n="btn.probe">测试连接并获取信息</button><span id="probeInfo" class="note"></span></div>
 <span id="probeWarn" class="note"></span>
+<span class="note full" data-i18n="hint.secret">密码与密钥不再回显：留空保持原值，输入 - 清空已保存内容</span>
 </div></section>
-<div class="actions"><span class="note"></span><button class="save" type="submit" data-i18n="btn.connect">保存并连接</button></div>
-</form></main>
+<div class="actions"><span id="saveInfo" class="note"></span><button class="save" type="submit" data-i18n="btn.connect">保存并连接</button></div>
+</form>
+<span id="connectState" class="hidden" data-state="__CONNECT_STATE__"></span></main>
 <script>
 (function(){
 var scan=document.getElementById('scanBtn'),info=document.getElementById('scanInfo'),probe=document.getElementById('probeBtn'),probeInfo=document.getElementById('probeInfo');
@@ -188,12 +197,20 @@ function fillList(list,keep){
 sel.onchange=syncSsid;
 manual.oninput=function(){hidden.value=manual.value};
 scan.onclick=function(){scanState.kind='probing';renderScan();getJson('/scan').then(function(a){lastScan=a;fillList(a,currentSsid());scanState.kind='ok';scanState.count=a.length;renderScan()}).catch(function(){scanState.kind='fail';renderScan()})};
-probe.onclick=function(){probeState.kind='probing';renderProbe();getJson('/probe',{method:'POST',body:formBody(['ssid','wifiPassword'])}).then(function(d){if(d.ok){fillAddress(d);probeState.kind='ok';probeState.ip=d.ip}else{probeState.kind='fail'}renderProbe()}).catch(function(){probeState.kind='error';renderProbe()})};
-document.getElementById('language').onclick=function(){EN=!EN;applyLang();fillList(lastScan,currentSsid());renderScan();renderProbe()};
+function probeResult(s){if(s.state==='ok'){probeState.kind='ok';probeState.ip=s.ip||'';fillAddress(s)}else{probeState.kind='fail'}renderProbe()}
+function pollProbe(){getJson('/probe').then(function(s){if(s.state==='pending'){setTimeout(pollProbe,1500);return}probeResult(s)}).catch(function(){probeState.kind='error';renderProbe()})}
+probe.onclick=function(){probeState.kind='probing';renderProbe();getJson('/probe',{method:'POST',body:formBody(['ssid','wifiPassword'])}).then(function(s){if(s.state==='pending'){setTimeout(pollProbe,1500)}else{probeResult(s)}}).catch(function(){probeState.kind='error';renderProbe()})};
+var connectEl=document.getElementById('connectState');
+var connectKind=connectEl?connectEl.dataset.state:'idle';
+function renderConnect(){var el=document.getElementById('saveInfo');if(!el)return;if(connectKind==='pending'){el.textContent=L('hint.connecting')}else if(connectKind==='ok'){el.textContent=L('hint.connectOk')}else if(connectKind==='fail'){el.textContent=L('hint.connectFail')}else{el.textContent=''}}
+function pollConnect(){getJson('/connectstate').then(function(s){connectKind=s.state;renderConnect();if(s.state==='pending'){setTimeout(pollConnect,1500)}}).catch(function(){})}
+if(connectKind==='pending'){setTimeout(pollConnect,1500)}
+document.getElementById('language').onclick=function(){EN=!EN;applyLang();fillList(lastScan,currentSsid());renderScan();renderProbe();renderConnect()};
 fillList(null,currentSsid());
 applyLang();
 renderScan();
 renderProbe();
+renderConnect();
 })();
 </script>
 )HTML";
@@ -219,7 +236,7 @@ __MESSAGE__
 <label><span data-i18n="lab.ssid">WiFi 名称</span><select id="ssidSelect"></select></label>
 <label id="ssidManualWrap" class="hidden"><span data-i18n="lab.ssidManual">手动输入 WiFi 名称</span><input id="ssidManual" value="__SSID__"></label>
 <input type="hidden" id="ssid" name="ssid" value="__SSID__">
-<label><span data-i18n="lab.wifipass">WiFi 密码</span><input name="wifiPassword" type="password" value="__WIFI_PASSWORD__"></label>
+<label><span data-i18n="lab.wifipass">WiFi 密码</span><input name="wifiPassword" type="password" value="" data-i18n-ph="hint.secretShort"></label>
 <div class="row full"><button class="btn" type="button" id="scanBtn" data-i18n="btn.scan">扫描附近 WiFi</button><span id="scanInfo" class="note"></span></div>
 <label><span data-i18n="lab.ip">设备 IP</span><input name="ip" value="__IP__"></label>
 <label><span data-i18n="lab.gateway">网关</span><input name="gateway" value="__GATEWAY__"></label>
@@ -233,25 +250,25 @@ __MESSAGE__
 <label><span data-i18n="lab.provider">服务商</span><select name="ddnsProvider" id="provider"><option value="generic" data-i18n="opt.generic">通用 Callback</option><option value="aliyun" data-i18n="opt.aliyun">阿里云 DNS</option><option value="cloudflare" data-i18n="opt.cloudflare">Cloudflare</option><option value="dnspod" data-i18n="opt.dnspod">腾讯云 DNSPod</option></select></label>
 <label><span data-i18n="lab.domain">域名</span><input name="hostname" value="__HOSTNAME__"></label>
 <label><span data-i18n="lab.user">用户名</span><input name="ddnsUsername" value="__DDNS_USERNAME__"></label>
-<label><span data-i18n="lab.pass">密码</span><input name="ddnsPassword" type="password" value="__DDNS_PASSWORD__"></label>
+<label><span data-i18n="lab.pass">密码</span><input name="ddnsPassword" type="password" value="" data-i18n-ph="hint.secretShort"></label>
 <label class="full"><span data-i18n="lab.url">更新 URL</span><input name="ddnsUrl" value="__DDNS_URL__"></label>
 </div></div></section>
 <section class="section view ddns hidden" id="aliyun"><div class="section-head"><h2 data-i18n="sec.aliyun">阿里云 DNS</h2><span>ALIYUN API</span></div><div class="section-body"><div class="form">
 <label><span data-i18n="lab.akid">AccessKey ID</span><input name="aliyunAccessKeyId" value="__ALIYUN_ID__"></label>
-<label><span data-i18n="lab.aksecret">AccessKey Secret</span><input name="aliyunAccessKeySecret" type="password" value="__ALIYUN_SECRET__"></label>
+<label><span data-i18n="lab.aksecret">AccessKey Secret</span><input name="aliyunAccessKeySecret" type="password" value="" data-i18n-ph="hint.secretShort"></label>
 <label><span data-i18n="lab.rootdomain">根域名</span><input name="aliyunDomainName" value="__ALIYUN_DOMAIN__"></label>
 <label><span data-i18n="lab.rr">RR 主机记录</span><input name="aliyunRR" value="__ALIYUN_RR__"></label>
 <label><span data-i18n="lab.rtype">记录类型</span><select name="aliyunType" id="aliyunType"><option value="A">A</option><option value="AAAA">AAAA</option><option value="CNAME">CNAME</option></select></label>
 <span class="note full" data-i18n="hint.onlyA">仅 A 记录支持自动更新</span>
 </div></div></section>
 <section class="section view ddns hidden" id="cloudflare"><div class="section-head"><h2 data-i18n="sec.cloudflare">Cloudflare DNS</h2><span>CLOUDFLARE API</span></div><div class="section-body"><div class="form">
-<label><span data-i18n="lab.cftoken">API Token</span><input name="cloudflareApiToken" type="password" value="__CF_TOKEN__"></label>
+<label><span data-i18n="lab.cftoken">API Token</span><input name="cloudflareApiToken" type="password" value="" data-i18n-ph="hint.secretShort"></label>
 <label><span data-i18n="lab.cfzone">Zone ID</span><input name="cloudflareZoneId" value="__CF_ZONE__"></label>
 <label><span data-i18n="lab.cfrecord">Record ID</span><input name="cloudflareRecordId" value="__CF_RECORD__"></label>
 </div></div></section>
 <section class="section view ddns hidden" id="dnspod"><div class="section-head"><h2 data-i18n="sec.dnspod">腾讯云 DNSPod</h2><span>DNSPOD API</span></div><div class="section-body"><div class="form">
 <label><span data-i18n="lab.txid">SecretId</span><input name="tencentSecretId" value="__TX_ID__"></label>
-<label><span data-i18n="lab.txsecret">SecretKey</span><input name="tencentSecretKey" type="password" value="__TX_SECRET__"></label>
+<label><span data-i18n="lab.txsecret">SecretKey</span><input name="tencentSecretKey" type="password" value="" data-i18n-ph="hint.secretShort"></label>
 <label><span data-i18n="lab.txdomain">主域名</span><input name="tencentDomain" value="__TX_DOMAIN__"></label>
 <label><span data-i18n="lab.txsub">子域名</span><input name="tencentSubDomain" value="__TX_SUBDOMAIN__"></label>
 <label><span data-i18n="lab.txtype">记录类型</span><select name="tencentRecordType" id="tencentRecordType"><option value="A">A</option><option value="AAAA">AAAA</option><option value="CNAME">CNAME</option></select></label>
@@ -266,9 +283,12 @@ __MESSAGE__
 <label><span data-i18n="lab.force">强制更新秒</span><input name="ddnsForceSec" type="number" value="__FORCE__"></label>
 <label class="full"><span data-i18n="lab.body">Callback 请求体</span><textarea name="ddnsBody">__BODY__</textarea></label>
 <label class="full"><span data-i18n="lab.headers">Callback Headers</span><textarea name="ddnsHeaders">__HEADERS__</textarea></label>
+<label class="check full"><input type="checkbox" name="tlsInsecure" value="1"__TLS_CHECKED__><span data-i18n="lab.tls">校验 HTTPS 证书（自建或自签证书可取消勾选）</span></label>
+<span class="note full" data-i18n="hint.secret">密码与密钥不再回显：留空保持原值，输入 - 清空已保存内容</span>
 </div></div></section>
 <section class="section view security hidden"><div class="section-head"><h2 data-i18n="sec.security">安全与访问</h2><span>ACCESS CONTROL</span></div><div class="section-body"><div class="form">
-<label><span data-i18n="lab.appass">配置 AP 新密码</span><input name="apPassword" type="password" value="__AP_PASSWORD__"></label>
+<label><span data-i18n="lab.appass">配置 AP 新密码</span><input name="apPassword" type="password" value="" data-i18n-ph="hint.secretShort"></label>
+<span class="note full" data-i18n="hint.secret">密码与密钥不再回显：留空保持原值，输入 - 清空已保存内容</span>
 </div></div></section>
 <div class="actions"><span class="note"></span><button class="save" type="submit" data-i18n="btn.save">保存并重启</button></div>
 </form></main></div>

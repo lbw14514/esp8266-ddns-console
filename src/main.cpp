@@ -8,18 +8,52 @@
 #include <ArduinoJson.h>
 #include <bearssl/bearssl_hmac.h>
 #include <bearssl/bearssl_hash.h>
+#include <stddef.h>
 #include <time.h>
 #include "web_ui.h"
+#include "tls_roots.h"
 
 namespace {
 constexpr uint32_t CONFIG_MAGIC = 0x4553503C;
 constexpr size_t EEPROM_SIZE = 4096;
+constexpr uint16_t WIFI_CONNECT_TIMEOUT_MS = 15000;
 constexpr uint32_t WIFI_RETRY_INTERVAL_MS = 15000;
+constexpr uint32_t PORTAL_FALLBACK_DELAY_MS = 5000;
+constexpr uint32_t PORTAL_HOLD_MS = 600000;
+constexpr uint32_t RESTART_DELAY_MS = 900;
+constexpr size_t AP_PASSWORD_MIN_LENGTH = 8;
+constexpr size_t STREAM_CHUNK_SIZE = 448;
+constexpr size_t STREAM_LOOKAHEAD_SIZE = 32;
+constexpr size_t MAX_PAGE_TOKENS = 48;
+constexpr size_t MAX_SCAN_RESULTS = 24;
+constexpr uint16_t DEFAULT_WEB_PORT = 80;
 constexpr uint32_t DEFAULT_DDNS_INTERVAL_SEC = 600;
 constexpr uint32_t DEFAULT_DDNS_RETRY_SEC = 60;
 constexpr uint32_t DEFAULT_DDNS_FORCE_SEC = 86400;
+constexpr uint32_t DDNS_INTERVAL_MIN_SEC = 10;
+constexpr uint32_t DDNS_INTERVAL_MAX_SEC = 604800;
+constexpr uint32_t DDNS_RETRY_MIN_SEC = 10;
+constexpr uint32_t DDNS_RETRY_MAX_SEC = 3600;
+constexpr uint32_t DDNS_FORCE_MIN_SEC = 600;
+constexpr uint32_t DDNS_FORCE_MAX_SEC = 2592000;
+constexpr time_t MIN_VALID_EPOCH = 1000000000;
 constexpr uint16_t SETUP_AP_CHANNEL_DELAY_MS = 300;
-const char SETUP_AP_SSID[] = "ESP8266-Setup";
+constexpr char CLEAR_SECRET_VALUE[] = "-";
+constexpr char SETUP_AP_SSID[] = "ESP8266-Setup";
+constexpr char DDNS_GET[] = "GET";
+constexpr char DDNS_POST[] = "POST";
+const char ALIYUN_API_HOST[] = "https://alidns.aliyuncs.com/?";
+const char ALIYUN_API_VERSION[] = "2015-01-09";
+const char ALIYUN_RR_DEFAULT[] = "@";
+const char DNSPOD_API_HOST[] = "https://dnspod.tencentcloudapi.com";
+const char DNSPOD_API_NAME[] = "dnspod.tencentcloudapi.com";
+const char DNSPOD_SERVICE[] = "dnspod";
+const char DNSPOD_API_VERSION[] = "2021-03-23";
+const char CALLBACK_RECORD_TYPE[] = "A";
+const char CALLBACK_RECORD_TTL[] = "600";
+const char* const DDNS_PROVIDERS[] = {"generic", "aliyun", "cloudflare", "dnspod"};
+const char* const DDNS_RECORD_TYPES[] = {"A", "AAAA", "CNAME"};
+const char* const NTP_SERVERS[] = {"pool.ntp.org", "time.nist.gov"};
 
 const char* const DEFAULT_PUBLIC_IP_APIS[] = {
   "https://api.ipify.org",
@@ -65,25 +99,154 @@ struct DeviceConfig {
   uint32_t ddnsRetrySec;
   uint32_t ddnsForceSec;
   uint16_t webPort;
+  uint8_t tlsInsecure;
+  uint32_t crc;
+};
+
+enum class ConnectJob : uint8_t { None, Probe, Save };
+
+struct ConnectAttempt {
+  ConnectJob job = ConnectJob::None;
+  uint32_t startedAt = 0;
+  uint32_t restartAt = 0;
+  bool active = false;
+  bool resultReady = false;
+  bool succeeded = false;
+  bool dhcpAddresses = false;
 };
 
 DeviceConfig config{};
-ESP8266WebServer server(80);
-ESP8266WebServer* activeServer = &server;
-ESP8266WebServer apServer(80);
+DeviceConfig pendingConfig{};
+ConnectAttempt connectAttempt;
+ESP8266WebServer dashboardServer(DEFAULT_WEB_PORT);
+ESP8266WebServer apServer(DEFAULT_WEB_PORT);
 bool setupPortalActive = false;
 bool serverStarted = false;
 bool apRoutesReady = false;
+bool dashboardRoutesReady = false;
 uint32_t lastWifiRetry = 0;
 uint32_t portalHoldUntil = 0;
 String currentDdnsIp;
 String lastDdnsIp;
 uint32_t lastDdnsSync = 0;
 uint32_t nextDdnsAttempt = 0;
+BearSSL::X509List* trustAnchors = nullptr;
 
-void copyText(char* target, size_t targetSize, const String& value) {
-  value.toCharArray(target, targetSize);
+BearSSL::X509List* getTrustAnchors() {
+  if (trustAnchors == nullptr) {
+    trustAnchors = new BearSSL::X509List(TLS_ROOT_CA_BUNDLE);
+  }
+  return trustAnchors;
 }
+
+void configureSecureClient(BearSSL::WiFiClientSecure& client) {
+  if (config.tlsInsecure) {
+    client.setInsecure();
+    return;
+  }
+  client.setTrustAnchors(getTrustAnchors());
+}
+
+bool copyText(char* target, size_t targetSize, const String& value) {
+  bool fits = value.length() + 1 <= targetSize;
+  if (!fits) {
+    Serial.printf("字段超长已截断: %u -> %u\n",
+                  static_cast<unsigned>(value.length()),
+                  static_cast<unsigned>(targetSize - 1));
+  }
+  value.toCharArray(target, targetSize);
+  return fits;
+}
+
+void applySecretValue(char* field, size_t size, const String& submitted) {
+  String value = submitted;
+  value.trim();
+  if (value.length() == 0) {
+    return;
+  }
+  if (value == CLEAR_SECRET_VALUE) {
+    copyText(field, size, "");
+    return;
+  }
+  copyText(field, size, value);
+}
+
+bool isAllowedValue(const char* value, const char* const* allowed, size_t count) {
+  for (size_t index = 0; index < count; index++) {
+    if (strcmp(value, allowed[index]) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void normalizeProvider(char* provider, size_t size) {
+  if (!isAllowedValue(provider, DDNS_PROVIDERS, sizeof(DDNS_PROVIDERS) / sizeof(DDNS_PROVIDERS[0]))) {
+    copyText(provider, size, DDNS_PROVIDERS[0]);
+  }
+}
+
+void normalizeRecordType(char* recordType, size_t size) {
+  if (!isAllowedValue(recordType, DDNS_RECORD_TYPES, sizeof(DDNS_RECORD_TYPES) / sizeof(DDNS_RECORD_TYPES[0]))) {
+    copyText(recordType, size, CALLBACK_RECORD_TYPE);
+  }
+}
+
+bool isCallbackRecordType(const char* recordType) {
+  return strcmp(recordType, CALLBACK_RECORD_TYPE) == 0;
+}
+
+bool parsePort(const String& text, uint16_t& port) {
+  String value = text;
+  value.trim();
+  if (value.length() == 0) {
+    return false;
+  }
+  for (size_t index = 0; index < value.length(); index++) {
+    if (!isDigit(value[index])) {
+      return false;
+    }
+  }
+  long parsed = value.toInt();
+  if (parsed < 1 || parsed > 65535) {
+    return false;
+  }
+  port = static_cast<uint16_t>(parsed);
+  return true;
+}
+
+uint32_t randomWord() {
+  return RANDOM_REG32;
+}
+
+String makeNonce() {
+  String nonce(ESP.getChipId(), HEX);
+  nonce += '-'; nonce += String(randomWord(), HEX);
+  nonce += '-'; nonce += String(micros(), HEX);
+  nonce += '-'; nonce += String(ESP.getCycleCount(), HEX);
+  return nonce;
+}
+
+void startClock() {
+  configTime(0, 0, NTP_SERVERS[0], NTP_SERVERS[1]);
+}
+
+uint32_t crc32Of(const uint8_t* data, size_t length) {
+  uint32_t crc = 0xFFFFFFFF;
+  for (size_t index = 0; index < length; index++) {
+    crc ^= data[index];
+    for (uint8_t bit = 0; bit < 8; bit++) {
+      crc = (crc >> 1) ^ (0xEDB88320 & (0 - (crc & 1)));
+    }
+  }
+  return ~crc;
+}
+
+uint32_t configChecksum() {
+  return crc32Of(reinterpret_cast<const uint8_t*>(&config), offsetof(DeviceConfig, crc));
+}
+
+bool saveConfig();
 
 void setDefaults() {
   memset(&config, 0, sizeof(config));
@@ -97,35 +260,48 @@ void setDefaults() {
   copyText(config.aliyunType, sizeof(config.aliyunType), "A");
   copyText(config.tencentRecordType, sizeof(config.tencentRecordType), "A");
   copyText(config.ddnsIpUrl, sizeof(config.ddnsIpUrl), DEFAULT_PUBLIC_IP_APIS[0]);
-  copyText(config.ddnsMethod, sizeof(config.ddnsMethod), "GET");
+  copyText(config.ddnsMethod, sizeof(config.ddnsMethod), DDNS_GET);
   config.ddnsIntervalSec = DEFAULT_DDNS_INTERVAL_SEC;
   config.ddnsRetrySec = DEFAULT_DDNS_RETRY_SEC;
   config.ddnsForceSec = DEFAULT_DDNS_FORCE_SEC;
-  config.webPort = 80;
+  config.webPort = DEFAULT_WEB_PORT;
+  config.tlsInsecure = 0;
 }
 
-void loadConfig() {
+bool configRangeValid() {
+  return config.ddnsIntervalSec >= DDNS_INTERVAL_MIN_SEC && config.ddnsIntervalSec <= DDNS_INTERVAL_MAX_SEC &&
+         config.ddnsRetrySec >= DDNS_RETRY_MIN_SEC && config.ddnsRetrySec <= DDNS_RETRY_MAX_SEC &&
+         config.ddnsForceSec >= DDNS_FORCE_MIN_SEC && config.ddnsForceSec <= DDNS_FORCE_MAX_SEC &&
+         config.webPort != 0;
+}
+
+bool loadConfig() {
   EEPROM.begin(EEPROM_SIZE);
   EEPROM.get(0, config);
-  if (config.magic != CONFIG_MAGIC || config.webPort == 0) {
+  if (config.magic != CONFIG_MAGIC || config.crc != configChecksum() || !configRangeValid()) {
+    Serial.println("配置无效或已损坏，恢复默认值");
     setDefaults();
-    return;
+    saveConfig();
+    return false;
   }
-  if (config.ddnsIntervalSec < 10 || config.ddnsIntervalSec > 604800) {
-    config.ddnsIntervalSec = DEFAULT_DDNS_INTERVAL_SEC;
+  normalizeProvider(config.ddnsProvider, sizeof(config.ddnsProvider));
+  normalizeRecordType(config.aliyunType, sizeof(config.aliyunType));
+  normalizeRecordType(config.tencentRecordType, sizeof(config.tencentRecordType));
+  if (strcasecmp(config.ddnsMethod, DDNS_POST) != 0) {
+    copyText(config.ddnsMethod, sizeof(config.ddnsMethod), DDNS_GET);
   }
-  if (config.ddnsRetrySec < 10 || config.ddnsRetrySec > 3600) {
-    config.ddnsRetrySec = DEFAULT_DDNS_RETRY_SEC;
-  }
-  if (config.ddnsForceSec < 600 || config.ddnsForceSec > 2592000) {
-    config.ddnsForceSec = DEFAULT_DDNS_FORCE_SEC;
-  }
+  return true;
 }
 
-void saveConfig() {
+bool saveConfig() {
   config.magic = CONFIG_MAGIC;
+  config.crc = configChecksum();
   EEPROM.put(0, config);
-  EEPROM.commit();
+  if (EEPROM.commit()) {
+    return true;
+  }
+  Serial.println("配置写入 EEPROM 失败");
+  return false;
 }
 
 bool parseIp(const char* text, IPAddress& address) {
@@ -200,7 +376,7 @@ bool connectWithAvailableStaticIp() {
   }
   WiFi.begin(config.wifiSsid, config.wifiPassword);
   uint32_t startedAt = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startedAt < 15000) {
+  while (WiFi.status() != WL_CONNECTED && millis() - startedAt < WIFI_CONNECT_TIMEOUT_MS) {
     delay(250);
     Serial.print('.');
   }
@@ -209,11 +385,18 @@ bool connectWithAvailableStaticIp() {
 }
 
 String htmlEscape(const String& value) {
-  String escaped = value;
-  escaped.replace("&", "&amp;");
-  escaped.replace("<", "&lt;");
-  escaped.replace(">", "&gt;");
-  escaped.replace("\"", "&quot;");
+  String escaped;
+  escaped.reserve(value.length() + 16);
+  for (size_t index = 0; index < value.length(); index++) {
+    switch (value[index]) {
+      case '&': escaped += F("&amp;"); break;
+      case '<': escaped += F("&lt;"); break;
+      case '>': escaped += F("&gt;"); break;
+      case '"': escaped += F("&quot;"); break;
+      case '\'': escaped += F("&#39;"); break;
+      default: escaped += value[index];
+    }
+  }
   return escaped;
 }
 
@@ -228,15 +411,25 @@ void sendJson(ESP8266WebServer& target, int code, const String& body) {
   target.send(code, "application/json", body);
 }
 
+String escapeJson(const String& value);
+
+void appendNetworkAddresses(String& json) {
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+  json += ",\"ssid\":\"" + escapeJson(WiFi.SSID()) + "\"";
+  json += ",\"ip\":\"" + WiFi.localIP().toString() + "\"";
+  json += ",\"gateway\":\"" + WiFi.gatewayIP().toString() + "\"";
+  json += ",\"subnet\":\"" + WiFi.subnetMask().toString() + "\"";
+  json += ",\"dns\":\"" + WiFi.dnsIP().toString() + "\"";
+  json += ",\"rssi\":" + String(WiFi.RSSI());
+}
+
 String currentNetworkJson(bool ok) {
   String json = "{\"ok\":";
   json += ok ? "true" : "false";
   if (ok) {
-    json += ",\"ip\":\"" + WiFi.localIP().toString() + "\"";
-    json += ",\"gateway\":\"" + WiFi.gatewayIP().toString() + "\"";
-    json += ",\"subnet\":\"" + WiFi.subnetMask().toString() + "\"";
-    json += ",\"dns\":\"" + WiFi.dnsIP().toString() + "\"";
-    json += ",\"rssi\":" + String(WiFi.RSSI());
+    appendNetworkAddresses(json);
   }
   json += "}";
   return json;
@@ -301,9 +494,14 @@ struct PageToken {
 struct TokenCollector {
   PageToken* tokens;
   size_t count;
+  size_t capacity;
 };
 
 void replaceAll(TokenCollector& collector, const char* key, const String& value) {
+  if (collector.count >= collector.capacity) {
+    Serial.printf("页面占位符超出容量，已忽略: %s\n", key);
+    return;
+  }
   collector.tokens[collector.count].key = key;
   collector.tokens[collector.count].value = value;
   collector.count++;
@@ -332,9 +530,9 @@ size_t streamSection(ESP8266WebServer* target, const char* section, const PageTo
     }
     return total;
   }
-  const size_t chunkSize = 448;
-  const size_t lookSize = 32;
-  char buffer[chunkSize + lookSize];
+  const size_t chunkSize = STREAM_CHUNK_SIZE;
+  const size_t lookSize = STREAM_LOOKAHEAD_SIZE;
+  char buffer[STREAM_CHUNK_SIZE + STREAM_LOOKAHEAD_SIZE];
   size_t position = 0;
   size_t written = 0;
   while (position < total) {
@@ -404,76 +602,186 @@ void sendHtmlPage(ESP8266WebServer& target, int code, const char* body, const Pa
   streamSection(&target, PAGE_END, nullptr, 0);
 }
 
+void clearConnectResult() {
+  if (connectAttempt.active) {
+    return;
+  }
+  connectAttempt.job = ConnectJob::None;
+  connectAttempt.resultReady = false;
+  connectAttempt.succeeded = false;
+  connectAttempt.restartAt = 0;
+}
+
+const char* connectStateName() {
+  if (connectAttempt.active) {
+    return "pending";
+  }
+  if (!connectAttempt.resultReady) {
+    return "idle";
+  }
+  return connectAttempt.succeeded ? "ok" : "fail";
+}
+
+String connectStateJson() {
+  String json = "{\"state\":\"";
+  json += connectStateName();
+  json += "\",\"job\":\"";
+  switch (connectAttempt.job) {
+    case ConnectJob::Probe: json += "probe"; break;
+    case ConnectJob::Save: json += "save"; break;
+    default: json += "none"; break;
+  }
+  json += "\"";
+  if (!connectAttempt.active && connectAttempt.resultReady && connectAttempt.succeeded) {
+    appendNetworkAddresses(json);
+  }
+  json += "}";
+  return json;
+}
+
+void beginConnectAttempt(ConnectJob job, bool dhcpAddresses) {
+  connectAttempt.job = job;
+  connectAttempt.startedAt = millis();
+  connectAttempt.active = true;
+  connectAttempt.resultReady = false;
+  connectAttempt.succeeded = false;
+  connectAttempt.dhcpAddresses = dhcpAddresses;
+  connectAttempt.restartAt = 0;
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.disconnect();
+  delay(50);
+  WiFi.begin(pendingConfig.wifiSsid, pendingConfig.wifiPassword);
+}
+
+void finishConnectAttempt() {
+  connectAttempt.active = false;
+  connectAttempt.resultReady = true;
+  if (!connectAttempt.succeeded) {
+    if (strlen(config.wifiSsid) > 0) {
+      WiFi.begin(config.wifiSsid, config.wifiPassword);
+    }
+    Serial.println("WiFi 连接失败");
+    return;
+  }
+  Serial.printf("WiFi 连接成功: %s\n", pendingConfig.wifiSsid);
+  if (connectAttempt.job == ConnectJob::Probe) {
+    portalHoldUntil = millis() + PORTAL_HOLD_MS;
+    return;
+  }
+  if (connectAttempt.job == ConnectJob::Save) {
+    config = pendingConfig;
+    if (connectAttempt.dhcpAddresses) {
+      applyDhcpAddresses();
+      Serial.println("已按路由器分配的地址信息自动填写");
+    } else {
+      applyAddressFallback();
+    }
+    saveConfig();
+    portalHoldUntil = millis() + 3000;
+    connectAttempt.restartAt = millis() + 3000;
+  }
+}
+
+void serviceConnectAttempt() {
+  if (connectAttempt.active) {
+    if (WiFi.status() == WL_CONNECTED && WiFi.SSID() == String(pendingConfig.wifiSsid)) {
+      connectAttempt.succeeded = true;
+      finishConnectAttempt();
+    } else if (millis() - connectAttempt.startedAt >= WIFI_CONNECT_TIMEOUT_MS) {
+      connectAttempt.succeeded = false;
+      finishConnectAttempt();
+    }
+  }
+  if (connectAttempt.restartAt != 0 && static_cast<int32_t>(millis() - connectAttempt.restartAt) >= 0) {
+    ESP.restart();
+  }
+}
+
+struct PageField {
+  const char* token;
+  const char* value;
+};
+
+void addEscapedFields(TokenCollector& page, const PageField* fields, size_t count) {
+  for (size_t index = 0; index < count; index++) {
+    replaceAll(page, fields[index].token, htmlEscape(fields[index].value));
+  }
+}
+
 void sendDashboardPage(ESP8266WebServer& target, int code = 200, const String& message = "", const char* kind = "") {
-  static PageToken tokens[48];
-  TokenCollector page = {tokens, 0};
+  static PageToken tokens[MAX_PAGE_TOKENS];
+  TokenCollector page = {tokens, 0, MAX_PAGE_TOKENS};
+  const PageField fields[] = {
+    {"__SSID__", config.wifiSsid},
+    {"__IP__", config.staticIp},
+    {"__GATEWAY__", config.gateway},
+    {"__SUBNET__", config.subnet},
+    {"__DNS__", config.dns},
+    {"__HOSTNAME__", config.ddnsHostname},
+    {"__DDNS_USERNAME__", config.ddnsUsername},
+    {"__DDNS_URL__", config.ddnsUrl},
+    {"__ALIYUN_ID__", config.aliyunAccessKeyId},
+    {"__ALIYUN_DOMAIN__", config.aliyunDomainName},
+    {"__ALIYUN_RR__", config.aliyunRR},
+    {"__CF_ZONE__", config.cloudflareZoneId},
+    {"__CF_RECORD__", config.cloudflareRecordId},
+    {"__TX_ID__", config.tencentSecretId},
+    {"__TX_DOMAIN__", config.tencentDomain},
+    {"__TX_SUBDOMAIN__", config.tencentSubDomain},
+    {"__IP_URL__", config.ddnsIpUrl},
+    {"__SUCCESS__", config.ddnsSuccess},
+    {"__BODY__", config.ddnsBody},
+    {"__HEADERS__", config.ddnsHeaders},
+  };
+  bool connected = WiFi.status() == WL_CONNECTED;
   replaceAll(page, "__MESSAGE__", messageBlock(message, kind));
+  addEscapedFields(page, fields, sizeof(fields) / sizeof(fields[0]));
   replaceAll(page, "__AP_SSID__", SETUP_AP_SSID);
-  replaceAll(page, "__STATUS__", WiFi.status() == WL_CONNECTED ? "已连接" : "未连接");
-  replaceAll(page, "__STATUS_KEY__", WiFi.status() == WL_CONNECTED ? "val.on" : "val.off");
+  replaceAll(page, "__STATUS__", connected ? "已连接" : "未连接");
+  replaceAll(page, "__STATUS_KEY__", connected ? "val.on" : "val.off");
   replaceAll(page, "__LAN_IP__", WiFi.localIP().toString());
   replaceAll(page, "__PUBLIC_IP__", currentDdnsIp.length() ? currentDdnsIp : "未获取");
   replaceAll(page, "__WAN_KEY__", currentDdnsIp.length() ? "" : "val.none");
-  replaceAll(page, "__PROVIDER__", config.ddnsProvider);
-  replaceAll(page, "__SSID__", htmlEscape(config.wifiSsid));
-  replaceAll(page, "__WIFI_PASSWORD__", htmlEscape(config.wifiPassword));
-  replaceAll(page, "__IP__", config.staticIp);
-  replaceAll(page, "__GATEWAY__", config.gateway);
-  replaceAll(page, "__SUBNET__", config.subnet);
-  replaceAll(page, "__DNS__", config.dns);
-  replaceAll(page, "__PORT__", String(config.webPort));
-  replaceAll(page, "__HOSTNAME__", htmlEscape(config.ddnsHostname));
-  replaceAll(page, "__DDNS_USERNAME__", htmlEscape(config.ddnsUsername));
-  replaceAll(page, "__DDNS_PASSWORD__", htmlEscape(config.ddnsPassword));
-  replaceAll(page, "__DDNS_URL__", htmlEscape(config.ddnsUrl));
-  replaceAll(page, "__ALIYUN_ID__", htmlEscape(config.aliyunAccessKeyId));
-  replaceAll(page, "__ALIYUN_SECRET__", htmlEscape(config.aliyunAccessKeySecret));
-  replaceAll(page, "__ALIYUN_DOMAIN__", htmlEscape(config.aliyunDomainName));
-  replaceAll(page, "__ALIYUN_RR__", htmlEscape(config.aliyunRR));
-  replaceAll(page, "__ALIYUN_TYPE__", htmlEscape(config.aliyunType));
-  replaceAll(page, "__CF_TOKEN__", htmlEscape(config.cloudflareApiToken));
-  replaceAll(page, "__CF_ZONE__", htmlEscape(config.cloudflareZoneId));
-  replaceAll(page, "__CF_RECORD__", htmlEscape(config.cloudflareRecordId));
-  replaceAll(page, "__TX_ID__", htmlEscape(config.tencentSecretId));
-  replaceAll(page, "__TX_SECRET__", htmlEscape(config.tencentSecretKey));
-  replaceAll(page, "__TX_DOMAIN__", htmlEscape(config.tencentDomain));
-  replaceAll(page, "__TX_SUBDOMAIN__", htmlEscape(config.tencentSubDomain));
-  replaceAll(page, "__TX_TYPE__", htmlEscape(config.tencentRecordType));
-  replaceAll(page, "__IP_URL__", htmlEscape(config.ddnsIpUrl));
-  replaceAll(page, "__SUCCESS__", htmlEscape(config.ddnsSuccess));
+  replaceAll(page, "__PROVIDER__", htmlEscape(config.ddnsProvider));
   replaceAll(page, "__METHOD__", htmlEscape(config.ddnsMethod));
+  replaceAll(page, "__ALIYUN_TYPE__", htmlEscape(config.aliyunType));
+  replaceAll(page, "__TX_TYPE__", htmlEscape(config.tencentRecordType));
+  replaceAll(page, "__PORT__", String(config.webPort));
   replaceAll(page, "__INTERVAL__", String(config.ddnsIntervalSec));
   replaceAll(page, "__RETRY__", String(config.ddnsRetrySec));
   replaceAll(page, "__FORCE__", String(config.ddnsForceSec));
-  replaceAll(page, "__BODY__", htmlEscape(config.ddnsBody));
-  replaceAll(page, "__HEADERS__", htmlEscape(config.ddnsHeaders));
-  replaceAll(page, "__AP_PASSWORD__", htmlEscape(config.apPassword));
+  replaceAll(page, "__TLS_CHECKED__", config.tlsInsecure ? "" : " checked");
   sendHtmlPage(target, code, WEB_DASHBOARD_BODY, tokens, page.count);
 }
 
 void sendSetupPage(ESP8266WebServer& target, int code = 200, const String& message = "", const char* kind = "") {
-  static PageToken tokens[16];
-  TokenCollector page = {tokens, 0};
+  static PageToken tokens[MAX_PAGE_TOKENS];
+  TokenCollector page = {tokens, 0, MAX_PAGE_TOKENS};
+  const PageField fields[] = {
+    {"__IP__", config.staticIp},
+    {"__GATEWAY__", config.gateway},
+    {"__SUBNET__", config.subnet},
+    {"__DNS__", config.dns},
+  };
   replaceAll(page, "__MESSAGE__", messageBlock(message, kind));
+  addEscapedFields(page, fields, sizeof(fields) / sizeof(fields[0]));
   replaceAll(page, "__AP_SSID__", SETUP_AP_SSID);
   replaceAll(page, "__AP_IP__", WiFi.softAPIP().toString());
   replaceAll(page, "__SSID__", htmlEscape(config.wifiSsid));
-  replaceAll(page, "__WIFI_PASSWORD__", htmlEscape(config.wifiPassword));
-  replaceAll(page, "__AP_PASSWORD__", htmlEscape(config.apPassword));
-  replaceAll(page, "__IP__", config.staticIp);
-  replaceAll(page, "__GATEWAY__", config.gateway);
-  replaceAll(page, "__SUBNET__", config.subnet);
-  replaceAll(page, "__DNS__", config.dns);
   replaceAll(page, "__PORT__", String(config.webPort));
+  replaceAll(page, "__CONNECT_STATE__", connectStateName());
   sendHtmlPage(target, code, WEB_SETUP_BODY, tokens, page.count);
 }
 
-String escapeJsonText(const String& value) {
+String escapeJson(const String& value) {
   String escaped;
+  escaped.reserve(value.length() + 8);
   for (size_t index = 0; index < value.length(); index++) {
     char character = value[index];
     if (character == '"' || character == '\\') {
       escaped += '\\';
+      escaped += character;
+      continue;
     }
     if (static_cast<uint8_t>(character) >= 0x20) {
       escaped += character;
@@ -483,15 +791,16 @@ String escapeJsonText(const String& value) {
 }
 
 void handleApRoot() {
+  clearConnectResult();
   sendSetupPage(apServer, 200);
 }
 
 String buildScanJson() {
   String json = "[";
-  String seen[24];
+  String seen[MAX_SCAN_RESULTS];
   size_t seenCount = 0;
   int found = WiFi.scanNetworks(false, true);
-  for (int index = 0; index < found && seenCount < 24; index++) {
+  for (int index = 0; index < found && seenCount < MAX_SCAN_RESULTS; index++) {
     String ssid = WiFi.SSID(index);
     if (ssid.length() == 0) {
       continue;
@@ -510,7 +819,7 @@ String buildScanJson() {
     if (seenCount > 1) {
       json += ",";
     }
-    json += "{\"s\":\"" + escapeJsonText(ssid) + "\",\"r\":" + String(WiFi.RSSI(index)) + "}";
+    json += "{\"s\":\"" + escapeJson(ssid) + "\",\"r\":" + String(WiFi.RSSI(index)) + "}";
   }
   json += "]";
   WiFi.scanDelete();
@@ -522,7 +831,7 @@ void handleApScan() {
 }
 
 void handleDashboardScan() {
-  sendJson(*activeServer, 200, buildScanJson());
+  sendJson(dashboardServer, 200, buildScanJson());
 }
 
 void handleApNotFound() {
@@ -533,81 +842,66 @@ void handleApNetInfo() {
   sendJson(apServer, 200, currentNetworkJson(WiFi.status() == WL_CONNECTED));
 }
 
+void handleApConnectState() {
+  sendJson(apServer, 200, connectStateJson());
+}
+
 void handleApProbe() {
-  String ssid = apServer.arg("ssid");
-  String password = apServer.arg("wifiPassword");
-  if (ssid.length() == 0) {
-    sendJson(apServer, 200, "{\"ok\":false}");
+  if (apServer.method() == HTTP_GET || connectAttempt.active) {
+    sendJson(apServer, 200, connectStateJson());
     return;
   }
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.begin(ssid.c_str(), password.c_str());
-  uint32_t startedAt = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startedAt < 15000) {
-    delay(250);
+  String ssid = apServer.arg("ssid");
+  ssid.trim();
+  if (ssid.length() == 0) {
+    sendJson(apServer, 400, "{\"state\":\"fail\",\"reason\":\"ssid\"}");
+    return;
   }
-  bool connected = WiFi.status() == WL_CONNECTED;
-  if (connected) {
-    portalHoldUntil = millis() + 600000;
-  }
-  Serial.printf("测试连接 %s: %s\n", ssid.c_str(), connected ? "成功" : "失败");
-  sendJson(apServer, 200, currentNetworkJson(connected));
+  pendingConfig = config;
+  copyText(pendingConfig.wifiSsid, sizeof(pendingConfig.wifiSsid), ssid);
+  applySecretValue(pendingConfig.wifiPassword, sizeof(pendingConfig.wifiPassword), apServer.arg("wifiPassword"));
+  Serial.printf("测试连接 %s\n", pendingConfig.wifiSsid);
+  beginConnectAttempt(ConnectJob::Probe, false);
+  sendJson(apServer, 200, connectStateJson());
 }
 
 void handleDashboardNetInfo() {
-  sendJson(*activeServer, 200, currentNetworkJson(WiFi.status() == WL_CONNECTED));
+  sendJson(dashboardServer, 200, currentNetworkJson(WiFi.status() == WL_CONNECTED));
 }
 
 void handleApSave() {
-  DeviceConfig previous = config;
-  copyText(config.wifiSsid, sizeof(config.wifiSsid), apServer.arg("ssid"));
-  copyText(config.wifiPassword, sizeof(config.wifiPassword), apServer.arg("wifiPassword"));
-  copyText(config.apPassword, sizeof(config.apPassword), apServer.arg("apPassword"));
-  copyText(config.staticIp, sizeof(config.staticIp), apServer.arg("ip"));
-  copyText(config.gateway, sizeof(config.gateway), apServer.arg("gateway"));
-  copyText(config.subnet, sizeof(config.subnet), apServer.arg("subnet"));
-  copyText(config.dns, sizeof(config.dns), apServer.arg("dns"));
-  config.webPort = static_cast<uint16_t>(constrain(apServer.arg("port").toInt(), 1L, 65535L));
-
-  if (strlen(config.wifiSsid) == 0) {
-    config = previous;
+  if (connectAttempt.active) {
+    sendSetupPage(apServer, 409, "上一次连接仍在进行，请稍候。", "err");
+    return;
+  }
+  DeviceConfig candidate = config;
+  copyText(candidate.wifiSsid, sizeof(candidate.wifiSsid), apServer.arg("ssid"));
+  applySecretValue(candidate.wifiPassword, sizeof(candidate.wifiPassword), apServer.arg("wifiPassword"));
+  applySecretValue(candidate.apPassword, sizeof(candidate.apPassword), apServer.arg("apPassword"));
+  copyText(candidate.staticIp, sizeof(candidate.staticIp), apServer.arg("ip"));
+  copyText(candidate.gateway, sizeof(candidate.gateway), apServer.arg("gateway"));
+  copyText(candidate.subnet, sizeof(candidate.subnet), apServer.arg("subnet"));
+  copyText(candidate.dns, sizeof(candidate.dns), apServer.arg("dns"));
+  uint16_t port = 0;
+  if (!parsePort(apServer.arg("port"), port)) {
+    sendSetupPage(apServer, 400, "Web 端口需为 1-65535 之间的整数。", "err");
+    return;
+  }
+  candidate.webPort = port;
+  String ssid = candidate.wifiSsid;
+  ssid.trim();
+  if (ssid.length() == 0) {
     sendSetupPage(apServer, 400, "请填写或选择 WiFi 名称。", "err");
     return;
   }
-  if (strlen(config.apPassword) < 8) {
-    config = previous;
+  if (strlen(candidate.apPassword) < AP_PASSWORD_MIN_LENGTH) {
     sendSetupPage(apServer, 400, "配置 AP 密码至少需要 8 位。", "err");
     return;
   }
-
-  Serial.printf("尝试连接 WiFi: %s\n", config.wifiSsid);
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.begin(config.wifiSsid, config.wifiPassword);
-  uint32_t startedAt = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startedAt < 15000) {
-    delay(250);
-    Serial.print('.');
-  }
-  Serial.println();
-
-  if (WiFi.status() != WL_CONNECTED) {
-    config = previous;
-    WiFi.disconnect();
-    sendSetupPage(apServer, 400, "连接 WiFi 失败，请确认名称和密码后重试。", "err");
-    return;
-  }
-
-  if (apServer.arg("autoNet") == "1") {
-    applyDhcpAddresses();
-    Serial.println("已按路由器分配的地址信息自动填写");
-  } else {
-    applyAddressFallback();
-  }
-
-  saveConfig();
-  sendSetupPage(apServer, 200, "配置成功，设备正在重启并应用新的网络设置。", "ok");
-  delay(900);
-  ESP.restart();
+  pendingConfig = candidate;
+  Serial.printf("尝试连接 WiFi: %s\n", pendingConfig.wifiSsid);
+  beginConnectAttempt(ConnectJob::Save, apServer.arg("autoNet") == "1");
+  sendSetupPage(apServer, 200, "正在连接 WiFi，请稍候…", "ok");
 }
 
 void startSetupPortal() {
@@ -615,19 +909,20 @@ void startSetupPortal() {
     return;
   }
   if (serverStarted) {
-    activeServer->stop();
+    dashboardServer.stop();
     serverStarted = false;
   }
   WiFi.mode(WIFI_AP_STA);
   portalHoldUntil = 0;
   bool secured = strlen(config.apPassword) >= 8;
-  WiFi.softAP(SETUP_AP_SSID, secured ? config.apPassword : nullptr);
-  delay(SETUP_AP_CHANNEL_DELAY_MS);
+  WiFi.softAP(SETUP_AP_SSID, secured ? config.apPassword : nullptr);  delay(SETUP_AP_CHANNEL_DELAY_MS);
   if (!apRoutesReady) {
     apServer.on("/", HTTP_GET, handleApRoot);
     apServer.on("/scan", HTTP_GET, handleApScan);
     apServer.on("/netinfo", HTTP_GET, handleApNetInfo);
+    apServer.on("/connectstate", HTTP_GET, handleApConnectState);
     apServer.on("/probe", HTTP_POST, handleApProbe);
+    apServer.on("/probe", HTTP_GET, handleApProbe);
     apServer.on("/save", HTTP_POST, handleApSave);
     apServer.onNotFound(handleApNotFound);
     apRoutesReady = true;
@@ -650,65 +945,91 @@ void stopSetupPortal() {
 }
 
 void handleRoot() {
-  sendDashboardPage(*activeServer, 200);
+  sendDashboardPage(dashboardServer, 200);
 }
 
-bool applyFormConfig(ESP8266WebServer& source) {
-  copyText(config.wifiSsid, sizeof(config.wifiSsid), source.arg("ssid"));
-  copyText(config.wifiPassword, sizeof(config.wifiPassword), source.arg("wifiPassword"));
-  copyText(config.staticIp, sizeof(config.staticIp), source.arg("ip"));
-  copyText(config.gateway, sizeof(config.gateway), source.arg("gateway"));
-  copyText(config.subnet, sizeof(config.subnet), source.arg("subnet"));
-  copyText(config.dns, sizeof(config.dns), source.arg("dns"));
-  copyText(config.ddnsHostname, sizeof(config.ddnsHostname), source.arg("hostname"));
-  copyText(config.ddnsUsername, sizeof(config.ddnsUsername), source.arg("ddnsUsername"));
-  copyText(config.ddnsPassword, sizeof(config.ddnsPassword), source.arg("ddnsPassword"));
-  copyText(config.ddnsUrl, sizeof(config.ddnsUrl), source.arg("ddnsUrl"));
-  copyText(config.ddnsProvider, sizeof(config.ddnsProvider), source.arg("ddnsProvider"));
-  copyText(config.aliyunAccessKeyId, sizeof(config.aliyunAccessKeyId), source.arg("aliyunAccessKeyId"));
-  copyText(config.aliyunAccessKeySecret, sizeof(config.aliyunAccessKeySecret), source.arg("aliyunAccessKeySecret"));
-  copyText(config.aliyunDomainName, sizeof(config.aliyunDomainName), source.arg("aliyunDomainName"));
-  copyText(config.aliyunRR, sizeof(config.aliyunRR), source.arg("aliyunRR"));
-  copyText(config.aliyunType, sizeof(config.aliyunType), source.arg("aliyunType"));
-  copyText(config.cloudflareApiToken, sizeof(config.cloudflareApiToken), source.arg("cloudflareApiToken"));
-  copyText(config.cloudflareZoneId, sizeof(config.cloudflareZoneId), source.arg("cloudflareZoneId"));
-  copyText(config.cloudflareRecordId, sizeof(config.cloudflareRecordId), source.arg("cloudflareRecordId"));
-  copyText(config.tencentSecretId, sizeof(config.tencentSecretId), source.arg("tencentSecretId"));
-  copyText(config.tencentSecretKey, sizeof(config.tencentSecretKey), source.arg("tencentSecretKey"));
-  copyText(config.tencentDomain, sizeof(config.tencentDomain), source.arg("tencentDomain"));
-  copyText(config.tencentSubDomain, sizeof(config.tencentSubDomain), source.arg("tencentSubDomain"));
-  copyText(config.tencentRecordType, sizeof(config.tencentRecordType), source.arg("tencentRecordType"));
-  copyText(config.ddnsIpUrl, sizeof(config.ddnsIpUrl), source.arg("ddnsIpUrl"));
-  copyText(config.ddnsSuccess, sizeof(config.ddnsSuccess), source.arg("ddnsSuccess"));
-  copyText(config.ddnsMethod, sizeof(config.ddnsMethod), source.arg("ddnsMethod"));
-  copyText(config.ddnsBody, sizeof(config.ddnsBody), source.arg("ddnsBody"));
-  copyText(config.ddnsHeaders, sizeof(config.ddnsHeaders), source.arg("ddnsHeaders"));
-  config.ddnsIntervalSec = constrain(source.arg("ddnsIntervalSec").toInt(), 10L, 604800L);
-  config.ddnsRetrySec = constrain(source.arg("ddnsRetrySec").toInt(), 10L, 3600L);
-  config.ddnsForceSec = constrain(source.arg("ddnsForceSec").toInt(), 600L, 2592000L);
-  config.webPort = static_cast<uint16_t>(constrain(source.arg("port").toInt(), 1L, 65535L));
-  String apPassword = source.arg("apPassword");
-  if (apPassword.length() == 0 && strlen(config.apPassword) >= 8) {
-    return true;
-  }
-  if (apPassword.length() < 8) {
+bool applyFormConfig(ESP8266WebServer& source, String& error) {
+  DeviceConfig candidate = config;
+  copyText(candidate.wifiSsid, sizeof(candidate.wifiSsid), source.arg("ssid"));
+  applySecretValue(candidate.wifiPassword, sizeof(candidate.wifiPassword), source.arg("wifiPassword"));
+  copyText(candidate.staticIp, sizeof(candidate.staticIp), source.arg("ip"));
+  copyText(candidate.gateway, sizeof(candidate.gateway), source.arg("gateway"));
+  copyText(candidate.subnet, sizeof(candidate.subnet), source.arg("subnet"));
+  copyText(candidate.dns, sizeof(candidate.dns), source.arg("dns"));
+  copyText(candidate.ddnsHostname, sizeof(candidate.ddnsHostname), source.arg("hostname"));
+  copyText(candidate.ddnsUsername, sizeof(candidate.ddnsUsername), source.arg("ddnsUsername"));
+  applySecretValue(candidate.ddnsPassword, sizeof(candidate.ddnsPassword), source.arg("ddnsPassword"));
+  copyText(candidate.ddnsUrl, sizeof(candidate.ddnsUrl), source.arg("ddnsUrl"));
+  copyText(candidate.ddnsProvider, sizeof(candidate.ddnsProvider), source.arg("ddnsProvider"));
+  copyText(candidate.aliyunAccessKeyId, sizeof(candidate.aliyunAccessKeyId), source.arg("aliyunAccessKeyId"));
+  applySecretValue(candidate.aliyunAccessKeySecret, sizeof(candidate.aliyunAccessKeySecret), source.arg("aliyunAccessKeySecret"));
+  copyText(candidate.aliyunDomainName, sizeof(candidate.aliyunDomainName), source.arg("aliyunDomainName"));
+  copyText(candidate.aliyunRR, sizeof(candidate.aliyunRR), source.arg("aliyunRR"));
+  copyText(candidate.aliyunType, sizeof(candidate.aliyunType), source.arg("aliyunType"));
+  applySecretValue(candidate.cloudflareApiToken, sizeof(candidate.cloudflareApiToken), source.arg("cloudflareApiToken"));
+  copyText(candidate.cloudflareZoneId, sizeof(candidate.cloudflareZoneId), source.arg("cloudflareZoneId"));
+  copyText(candidate.cloudflareRecordId, sizeof(candidate.cloudflareRecordId), source.arg("cloudflareRecordId"));
+  copyText(candidate.tencentSecretId, sizeof(candidate.tencentSecretId), source.arg("tencentSecretId"));
+  applySecretValue(candidate.tencentSecretKey, sizeof(candidate.tencentSecretKey), source.arg("tencentSecretKey"));
+  copyText(candidate.tencentDomain, sizeof(candidate.tencentDomain), source.arg("tencentDomain"));
+  copyText(candidate.tencentSubDomain, sizeof(candidate.tencentSubDomain), source.arg("tencentSubDomain"));
+  copyText(candidate.tencentRecordType, sizeof(candidate.tencentRecordType), source.arg("tencentRecordType"));
+  copyText(candidate.ddnsIpUrl, sizeof(candidate.ddnsIpUrl), source.arg("ddnsIpUrl"));
+  copyText(candidate.ddnsSuccess, sizeof(candidate.ddnsSuccess), source.arg("ddnsSuccess"));
+  copyText(candidate.ddnsBody, sizeof(candidate.ddnsBody), source.arg("ddnsBody"));
+  copyText(candidate.ddnsHeaders, sizeof(candidate.ddnsHeaders), source.arg("ddnsHeaders"));
+  normalizeProvider(candidate.ddnsProvider, sizeof(candidate.ddnsProvider));
+  normalizeRecordType(candidate.aliyunType, sizeof(candidate.aliyunType));
+  normalizeRecordType(candidate.tencentRecordType, sizeof(candidate.tencentRecordType));
+  String method = source.arg("ddnsMethod");
+  method.toUpperCase();
+  copyText(candidate.ddnsMethod, sizeof(candidate.ddnsMethod), method == DDNS_POST ? DDNS_POST : DDNS_GET);
+  candidate.tlsInsecure = source.arg("tlsInsecure") == "1" ? 1 : 0;
+  uint16_t port = 0;
+  if (!parsePort(source.arg("port"), port)) {
+    error = "Web 端口需为 1-65535 之间的整数。";
     return false;
   }
-  copyText(config.apPassword, sizeof(config.apPassword), apPassword);
+  candidate.webPort = port;
+  long interval = source.arg("ddnsIntervalSec").toInt();
+  if (interval < static_cast<long>(DDNS_INTERVAL_MIN_SEC) || interval > static_cast<long>(DDNS_INTERVAL_MAX_SEC)) {
+    error = "DDNS 检查间隔需在 10-604800 秒之间。";
+    return false;
+  }
+  long retry = source.arg("ddnsRetrySec").toInt();
+  if (retry < static_cast<long>(DDNS_RETRY_MIN_SEC) || retry > static_cast<long>(DDNS_RETRY_MAX_SEC)) {
+    error = "DDNS 失败重试间隔需在 10-3600 秒之间。";
+    return false;
+  }
+  long force = source.arg("ddnsForceSec").toInt();
+  if (force < static_cast<long>(DDNS_FORCE_MIN_SEC) || force > static_cast<long>(DDNS_FORCE_MAX_SEC)) {
+    error = "DDNS 强制更新间隔需在 600-2592000 秒之间。";
+    return false;
+  }
+  candidate.ddnsIntervalSec = static_cast<uint32_t>(interval);
+  candidate.ddnsRetrySec = static_cast<uint32_t>(retry);
+  candidate.ddnsForceSec = static_cast<uint32_t>(force);
+  applySecretValue(candidate.apPassword, sizeof(candidate.apPassword), source.arg("apPassword"));
+  if (strlen(candidate.apPassword) < AP_PASSWORD_MIN_LENGTH) {
+    error = "配置 AP 密码至少需要 8 位。";
+    return false;
+  }
+  config = candidate;
   return true;
 }
 
 void handleSave() {
   DeviceConfig previous = config;
-  if (!applyFormConfig(*activeServer)) {
+  String error;
+  if (!applyFormConfig(dashboardServer, error)) {
     config = previous;
-    sendDashboardPage(*activeServer, 400, "配置 AP 密码至少需要 8 位。", "err");
+    sendDashboardPage(dashboardServer, 400, error, "err");
     return;
   }
   applyAddressFallback();
   saveConfig();
-  sendDashboardPage(*activeServer, 200, "配置已保存，设备正在重启。", "ok");
-  delay(900);
+  sendDashboardPage(dashboardServer, 200, "配置已保存，设备正在重启。", "ok");
+  delay(RESTART_DELAY_MS);
   ESP.restart();
 }
 
@@ -716,19 +1037,19 @@ void startWebServer() {
   if (serverStarted) {
     return;
   }
-  if (config.webPort == 80) {
-    activeServer = &server;
-  } else {
-    activeServer = new ESP8266WebServer(config.webPort);
+  if (!dashboardRoutesReady) {
+    dashboardServer.on("/", HTTP_GET, handleRoot);
+    dashboardServer.on("/netinfo", HTTP_GET, handleDashboardNetInfo);
+    dashboardServer.on("/scan", HTTP_GET, handleDashboardScan);
+    dashboardServer.on("/save", HTTP_POST, handleSave);
+    dashboardRoutesReady = true;
   }
-  activeServer->on("/", HTTP_GET, handleRoot);
-  activeServer->on("/netinfo", HTTP_GET, handleDashboardNetInfo);
-  activeServer->on("/scan", HTTP_GET, handleDashboardScan);
-  activeServer->on("/save", HTTP_POST, handleSave);
-  activeServer->begin();
+  dashboardServer.begin(config.webPort);
   serverStarted = true;
   Serial.printf("Web 服务: http://%s:%u\n", WiFi.localIP().toString().c_str(), config.webPort);
 }
+
+bool waitForNetworkTime(uint32_t timeoutMs);
 
 String replacePlaceholders(String url) {
   url.replace("{hostname}", config.ddnsHostname);
@@ -737,14 +1058,14 @@ String replacePlaceholders(String url) {
   url.replace("{password}", config.ddnsPassword);
   url.replace("#{domain}", config.ddnsHostname);
   url.replace("#{ip}", currentDdnsIp);
-  url.replace("#{recordType}", "A");
-  url.replace("#{ttl}", "600");
+  url.replace("#{recordType}", CALLBACK_RECORD_TYPE);
+  url.replace("#{ttl}", CALLBACK_RECORD_TTL);
   return url;
 }
 
 String httpGetBody(const String& url, int& status) {
   std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
-  client->setInsecure();
+  configureSecureClient(*client);
   HTTPClient http;
   if (!http.begin(*client, url)) {
     status = -1;
@@ -757,6 +1078,10 @@ String httpGetBody(const String& url, int& status) {
 }
 
 String fetchPublicIp() {
+  if (!config.tlsInsecure && !waitForNetworkTime(5000)) {
+    Serial.println("系统时间未就绪，跳过公网 IP 获取");
+    return "";
+  }
   String urls[DEFAULT_PUBLIC_IP_API_COUNT + 1];
   size_t urlCount = 0;
   if (strlen(config.ddnsIpUrl) > 0) {
@@ -892,7 +1217,7 @@ String hmacSha256Hex(const String& key, const String& message) {
 
 String utcTimestamp() {
   time_t now = time(nullptr);
-  if (now < 1000000000) {
+  if (now < MIN_VALID_EPOCH) {
     return "";
   }
   struct tm* utc = gmtime(&now);
@@ -904,18 +1229,64 @@ String utcTimestamp() {
 bool waitForNetworkTime(uint32_t timeoutMs) {
   time_t now = time(nullptr);
   uint32_t startedAt = millis();
-  while (now < 1000000000 && millis() - startedAt < timeoutMs) {
+  while (now < MIN_VALID_EPOCH && millis() - startedAt < timeoutMs) {
     delay(250);
     now = time(nullptr);
   }
-  return now >= 1000000000;
+  return now >= MIN_VALID_EPOCH;
+}
+
+String aliyunCommonParams(const char* action) {
+  String params = "AccessKeyId=" + percentEncode(config.aliyunAccessKeyId);
+  params += "&Action=";
+  params += action;
+  params += "&Format=JSON&SignatureMethod=HMAC-SHA1&SignatureNonce=";
+  params += makeNonce();
+  params += "&SignatureVersion=1.0&Timestamp=" + percentEncode(utcTimestamp());
+  params += "&Version=";
+  params += ALIYUN_API_VERSION;
+  return params;
 }
 
 String aliyunRequest(const String& canonicalQuery, int& status) {
   String stringToSign = "GET&%2F&" + percentEncode(canonicalQuery);
   String signature = percentEncode(hmacSha1Base64(String(config.aliyunAccessKeySecret) + "&", stringToSign));
-  String url = "https://alidns.aliyuncs.com/?" + canonicalQuery + "&Signature=" + signature;
+  String url = String(ALIYUN_API_HOST) + canonicalQuery + "&Signature=" + signature;
   return httpGetBody(url, status);
+}
+
+String aliyunFindRecordId(int& status) {
+  String query = aliyunCommonParams("DescribeDomainRecords");
+  query += "&DomainName=" + percentEncode(config.aliyunDomainName);
+  query += "&RRKeyWord=" + percentEncode(config.aliyunRR);
+  query += "&Type=" + percentEncode(config.aliyunType);
+  String response = aliyunRequest(query, status);
+  if (status != 200) {
+    return "";
+  }
+  DynamicJsonDocument document(4096);
+  if (deserializeJson(document, response)) {
+    return "";
+  }
+  for (JsonObject record : document["DomainRecords"]["Record"].as<JsonArray>()) {
+    if (String(record["RR"].as<const char*>()) == config.aliyunRR &&
+        String(record["Type"].as<const char*>()) == config.aliyunType) {
+      return record["RecordId"].as<String>();
+    }
+  }
+  return "";
+}
+
+bool aliyunWriteRecord(const String& recordId) {
+  String query = aliyunCommonParams("UpdateDomainRecord");
+  query += "&RR=" + percentEncode(config.aliyunRR);
+  query += "&RecordId=" + percentEncode(recordId);
+  query += "&Type=" + percentEncode(config.aliyunType);
+  query += "&Value=" + percentEncode(currentDdnsIp);
+  int status = 0;
+  String response = aliyunRequest(query, status);
+  Serial.printf("阿里云 DDNS 更新状态: %d\n", status);
+  return status == 200 && response.indexOf("ErrorCode") < 0;
 }
 
 bool updateAliyunDdns() {
@@ -924,63 +1295,17 @@ bool updateAliyunDdns() {
     Serial.println("阿里云 DDNS 配置不完整");
     return false;
   }
-  if (strcmp(config.aliyunType, "A") != 0) {
-    Serial.printf("阿里云记录类型 %s 暂不支持自动更新，已跳过\n", config.aliyunType);
-    return true;
-  }
   if (!waitForNetworkTime(5000)) {
     Serial.println("尚未获取网络时间，跳过阿里云 DDNS");
     return false;
   }
-  String timestamp = utcTimestamp();
-  String nonce = String(ESP.getChipId(), HEX) + String(millis());
-  String query = "AccessKeyId=" + percentEncode(config.aliyunAccessKeyId);
-  query += "&Action=DescribeDomainRecords";
-  query += "&DomainName=" + percentEncode(config.aliyunDomainName);
-  query += "&Format=JSON";
-  query += "&RRKeyWord=" + percentEncode(config.aliyunRR);
-  query += "&SignatureMethod=HMAC-SHA1&SignatureNonce=" + nonce;
-  query += "&SignatureVersion=1.0&Timestamp=" + percentEncode(timestamp);
-  query += "&Type=" + percentEncode(config.aliyunType);
-  query += "&Version=2015-01-09";
   int status = 0;
-  String response = aliyunRequest(query, status);
-  if (status != 200) {
-    Serial.printf("阿里云查询失败: %d\n", status);
-    return false;
-  }
-  DynamicJsonDocument document(4096);
-  if (deserializeJson(document, response)) {
-    Serial.println("阿里云响应解析失败");
-    return false;
-  }
-  String recordId;
-  for (JsonObject record : document["DomainRecords"]["Record"].as<JsonArray>()) {
-    if (String(record["RR"].as<const char*>()) == config.aliyunRR &&
-        String(record["Type"].as<const char*>()) == config.aliyunType) {
-      recordId = record["RecordId"].as<String>();
-      break;
-    }
-  }
+  String recordId = aliyunFindRecordId(status);
   if (recordId.length() == 0) {
-    Serial.println("阿里云未找到匹配 DNS 记录");
+    Serial.printf("阿里云未找到匹配 DNS 记录: %d\n", status);
     return false;
   }
-  timestamp = utcTimestamp();
-  nonce = String(ESP.getChipId(), HEX) + String(millis());
-  query = "AccessKeyId=" + percentEncode(config.aliyunAccessKeyId);
-  query += "&Action=UpdateDomainRecord";
-  query += "&Format=JSON";
-  query += "&RR=" + percentEncode(config.aliyunRR);
-  query += "&RecordId=" + percentEncode(recordId);
-  query += "&SignatureMethod=HMAC-SHA1&SignatureNonce=" + nonce;
-  query += "&SignatureVersion=1.0&Timestamp=" + percentEncode(timestamp);
-  query += "&Type=" + percentEncode(config.aliyunType);
-  query += "&Value=" + percentEncode(currentDdnsIp);
-  query += "&Version=2015-01-09";
-  response = aliyunRequest(query, status);
-  Serial.printf("阿里云 DDNS 更新状态: %d\n", status);
-  return status == 200 && response.indexOf("ErrorCode") < 0;
+  return aliyunWriteRecord(recordId);
 }
 
 bool updateCloudflareDdns() {
@@ -994,7 +1319,7 @@ bool updateCloudflareDdns() {
   url += "/dns_records/";
   url += config.cloudflareRecordId;
   std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
-  client->setInsecure();
+  configureSecureClient(*client);
   HTTPClient http;
   if (!http.begin(*client, url)) {
     Serial.println("Cloudflare API 无法连接");
@@ -1003,14 +1328,14 @@ bool updateCloudflareDdns() {
   http.addHeader("Authorization", "Bearer " + String(config.cloudflareApiToken));
   http.addHeader("Content-Type", "application/json");
   StaticJsonDocument<512> payload;
-  payload["type"] = "A";
+  payload["type"] = CALLBACK_RECORD_TYPE;
   payload["name"] = config.ddnsHostname;
   payload["content"] = currentDdnsIp;
   payload["ttl"] = 120;
   payload["proxied"] = false;
   String body;
   serializeJson(payload, body);
-  int status = http.PUT(body);
+  int status = http.sendRequest("PATCH", body);
   String response = http.getString();
   http.end();
   Serial.printf("Cloudflare DDNS 更新状态: %d\n", status);
@@ -1018,8 +1343,8 @@ bool updateCloudflareDdns() {
 }
 
 String tencentAuthorization(const String& payload, uint32_t timestamp) {
-  const String host = "dnspod.tencentcloudapi.com";
-  const String service = "dnspod";
+  const String host = DNSPOD_API_NAME;
+  const String service = DNSPOD_SERVICE;
   char dateBuffer[12];
   time_t currentTime = static_cast<time_t>(timestamp);
   strftime(dateBuffer, sizeof(dateBuffer), "%Y-%m-%d", gmtime(&currentTime));
@@ -1041,16 +1366,16 @@ String tencentAuthorization(const String& payload, uint32_t timestamp) {
 String tencentRequest(const String& action, const String& payload, int& status) {
   uint32_t timestamp = static_cast<uint32_t>(time(nullptr));
   std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
-  client->setInsecure();
+  configureSecureClient(*client);
   HTTPClient http;
-  if (!http.begin(*client, "https://dnspod.tencentcloudapi.com")) {
+  if (!http.begin(*client, DNSPOD_API_HOST)) {
     status = -1;
     return "";
   }
   http.addHeader("Content-Type", "application/json; charset=utf-8");
-  http.addHeader("Host", "dnspod.tencentcloudapi.com");
+  http.addHeader("Host", DNSPOD_API_NAME);
   http.addHeader("X-TC-Action", action);
-  http.addHeader("X-TC-Version", "2021-03-23");
+  http.addHeader("X-TC-Version", DNSPOD_API_VERSION);
   http.addHeader("X-TC-Timestamp", String(timestamp));
   http.addHeader("Authorization", tencentAuthorization(payload, timestamp));
   status = http.POST(payload);
@@ -1064,10 +1389,6 @@ bool updateTencentDdns() {
       strlen(config.tencentDomain) == 0 || strlen(config.tencentSubDomain) == 0) {
     Serial.println("腾讯云 DDNS 配置不完整");
     return false;
-  }
-  if (strcmp(config.tencentRecordType, "A") != 0) {
-    Serial.printf("腾讯云记录类型 %s 暂不支持自动更新，已跳过\n", config.tencentRecordType);
-    return true;
   }
   if (!waitForNetworkTime(5000)) {
     Serial.println("尚未获取网络时间，跳过腾讯云 DDNS");
@@ -1114,7 +1435,7 @@ bool updateGenericDdns() {
   }
   String url = replacePlaceholders(config.ddnsUrl);
   std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
-  client->setInsecure();
+  configureSecureClient(*client);
   HTTPClient http;
   if (!http.begin(*client, url)) {
     Serial.println("DDNS URL 无法连接");
@@ -1140,6 +1461,16 @@ void scheduleDdnsAttempt(bool success) {
   nextDdnsAttempt = millis() + delaySeconds * 1000UL;
 }
 
+bool providerSupportsRecordType() {
+  if (strcmp(config.ddnsProvider, "aliyun") == 0) {
+    return isCallbackRecordType(config.aliyunType);
+  }
+  if (strcmp(config.ddnsProvider, "dnspod") == 0) {
+    return isCallbackRecordType(config.tencentRecordType);
+  }
+  return true;
+}
+
 void updateDdns() {
   if (WiFi.status() != WL_CONNECTED) {
     scheduleDdnsAttempt(false);
@@ -1149,6 +1480,13 @@ void updateDdns() {
   if (currentDdnsIp.length() == 0) {
     Serial.println("公网 IP 获取失败");
     scheduleDdnsAttempt(false);
+    return;
+  }
+  if (!providerSupportsRecordType()) {
+    Serial.println("当前记录类型不支持自动更新，已跳过写入");
+    lastDdnsIp = currentDdnsIp;
+    lastDdnsSync = millis();
+    scheduleDdnsAttempt(true);
     return;
   }
   bool forceUpdate = lastDdnsSync == 0 || millis() - lastDdnsSync >= config.ddnsForceSec * 1000UL;
@@ -1185,7 +1523,7 @@ bool connectWifi() {
   WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE);
   WiFi.begin(config.wifiSsid, config.wifiPassword);
   uint32_t startedAt = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startedAt < 15000) {
+  while (WiFi.status() != WL_CONNECTED && millis() - startedAt < WIFI_CONNECT_TIMEOUT_MS) {
     delay(250);
     Serial.print('.');
   }
@@ -1202,7 +1540,7 @@ void setup() {
   delay(100);
   loadConfig();
   if (connectWifi()) {
-    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+    startClock();
     startWebServer();
     updateDdns();
   } else {
@@ -1211,28 +1549,34 @@ void setup() {
 }
 
 void loop() {
+  serviceConnectAttempt();
   if (setupPortalActive) {
     apServer.handleClient();
-    bool hold = portalHoldUntil != 0 && static_cast<int32_t>(millis() - portalHoldUntil) < 0;
-    bool backToConfiguredNetwork = strlen(config.wifiSsid) > 0 &&
-                                   WiFi.status() == WL_CONNECTED &&
-                                   WiFi.SSID() == String(config.wifiSsid);
-    if (!hold && backToConfiguredNetwork) {
-      stopSetupPortal();
+    if (!connectAttempt.active) {
+      bool hold = portalHoldUntil != 0 && static_cast<int32_t>(millis() - portalHoldUntil) < 0;
+      bool backToConfiguredNetwork = strlen(config.wifiSsid) > 0 &&
+                                     WiFi.status() == WL_CONNECTED &&
+                                     WiFi.SSID() == String(config.wifiSsid);
+      if (!hold && backToConfiguredNetwork) {
+        stopSetupPortal();
+      }
     }
+  } else if (connectAttempt.active) {
+    startSetupPortal();
+    apServer.handleClient();
   } else if (WiFi.status() == WL_CONNECTED) {
     if (!serverStarted) {
-      configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+      startClock();
       startWebServer();
       updateDdns();
     }
-    activeServer->handleClient();
+    dashboardServer.handleClient();
     if (static_cast<int32_t>(millis() - nextDdnsAttempt) >= 0) {
       updateDdns();
     }
   } else {
     if (serverStarted) {
-      activeServer->stop();
+      dashboardServer.stop();
       serverStarted = false;
     }
     if (millis() - lastWifiRetry >= WIFI_RETRY_INTERVAL_MS) {
@@ -1240,7 +1584,7 @@ void loop() {
       Serial.println("WiFi 已断开，尝试重连");
       WiFi.reconnect();
     }
-    if (millis() - lastWifiRetry >= 5000) {
+    if (millis() - lastWifiRetry >= PORTAL_FALLBACK_DELAY_MS) {
       startSetupPortal();
     }
   }
